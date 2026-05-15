@@ -12,8 +12,9 @@ abschalten willst.
 
 | Befehl | Was er macht |
 |---|---|
-| `register` (Default) | Neuen Bot anlegen, Passwort + Access-Token erzeugen, in Räume joinen, optional direkt in maubot eintragen |
+| `register` (Default) | Neuen Bot anlegen, Passwort + Access-Token erzeugen, in Räume joinen, in maubot eintragen, DM mit Usern starten |
 | `invite <bot> <raum>...` | Bestehenden Bot in (weitere) Räume joinen (Synapse Admin force-join) |
+| `dm <bot> <user>...` | Direkt-Chat zwischen Bot und einem oder mehreren Usern anlegen |
 | `rotate-token <bot>` | Mit dem gespeicherten Bot-Passwort einen neuen Access-Token holen |
 | `deactivate <bot> [--erase]` | Bot auf dem Server abschalten (optional Daten löschen) |
 | `maubot-add <bot>` | Bestehenden Bot als Client in eine [maubot](https://github.com/maubot/maubot)-Instanz eintragen |
@@ -127,6 +128,42 @@ Token kompromittiert oder einfach vorsichtig wechseln:
 
 Braucht **kein** Admin-Token — das Bot-Passwort steht in der Config. Die alte
 Config wird mit Zeitstempel als `.bak` gesichert.
+
+### Direkt-Chat mit einem User
+
+Sobald der Bot existiert, kannst du ihm einen 1-zu-1-DM mit dir (oder anderen
+Usern) öffnen lassen:
+
+```bash
+./matrix-register-bot.sh dm wetterbot @marc:example.org
+./matrix-register-bot.sh dm wetterbot marc                  # Kurzform
+./matrix-register-bot.sh dm wetterbot marc anna             # mehrere User -> mehrere DMs
+```
+
+Was passiert:
+
+1. Bot erstellt einen Raum (`preset: trusted_private_chat`, `is_direct: true`)
+2. Bot lädt den User ein
+3. Bot trägt den Raum in seine `m.direct`-Account-Data ein — dadurch zeigen
+   Matrix-Clients den Raum als 1-zu-1-Chat
+4. Bot sendet eine Begrüßungsnachricht (per Default; mit `--dm-no-message`
+   auslassbar; mit `--dm-message TEXT` selbst formulieren)
+
+> **Wichtig**: Der User muss die Einladung in seinem Matrix-Client annehmen.
+> Force-Join für DMs machen wir bewusst nicht.
+
+Idempotenz: Wenn schon ein DM zwischen Bot und User existiert, fragt das Skript
+interaktiv — in non-interactive wird der Schritt übersprungen.
+
+Im **register-Flow** kommt die Frage „DM-Raum mit einem User starten?"
+automatisch als Schritt 14 (nach maubot). Per Flag kannst du das im
+register-Aufruf direkt vorgeben:
+
+```bash
+./matrix-register-bot.sh register ... \
+  --dm @marc:example.org \
+  --dm-message "Hallo Marc, der neue Bot ist startklar."
+```
 
 ### Bot abschalten
 
@@ -294,6 +331,9 @@ Für 'register':
   --password PASS                Passwort vorgeben
   --generate-password            Zufälliges Passwort erzeugen
   --rooms "r1,r2,..."            Räume zum Auto-Join (kommasepariert)
+  --dm "@u1:dom,@u2:dom"         User für DM-Räume (kommasepariert)
+  --dm-message TEXT              Eigene Begrüßungsnachricht
+  --dm-no-message                Keine Begrüßungsnachricht senden
 
 Für 'deactivate':
   --erase                        Profil-Daten zusätzlich löschen (irreversibel)

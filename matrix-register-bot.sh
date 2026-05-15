@@ -69,6 +69,11 @@ MAUBOT_HOMESERVER_OVERRIDE="" # Optional: andere HS-URL, die NUR maubot benutzt
                               # im selben docker-compose laufen). Skript-Aufrufe
                               # gegen Synapse nutzen weiterhin HOMESERVER_URL.
 
+# Direct-Message-State
+DMS=()                   # User-MXIDs (vollqualifiziert), mit denen ein DM angelegt wird
+DM_MESSAGE=""            # Optionale Begruessungsnachricht (leer = Default-Text)
+DM_NO_MESSAGE="false"    # true = ueberhaupt keine Nachricht senden
+
 # =============================================================================
 #  UI-Helfer: Farben, Logs, Prompts
 # =============================================================================
@@ -840,6 +845,188 @@ register_in_maubot() {
 }
 
 # =============================================================================
+#  Direct-Message-Funktionen
+# =============================================================================
+#
+#  Ein DM auf Matrix ist technisch ein normaler Raum mit
+#    - is_direct: true beim Erstellen
+#    - preset: trusted_private_chat
+#    - einem Eintrag in der m.direct Account-Data des Bot-Users, der den Raum
+#      einem bestimmten Gegenueber zuordnet (Map: user_id -> [room_id, ...])
+#
+#  Wir nutzen den Bot-Access-Token (nicht den Admin-Token) — der Bot ist
+#  selbst der Raum-Creator und lae den Ziel-User ein. Den eigentlichen Beitritt
+#  muss der User in seinem Client annehmen — das koennen (und wollen) wir nicht
+#  fuer ihn erzwingen.
+# =============================================================================
+
+# normalize_user_id <input>: vervollstaendigt eine Matrix-ID.
+#   "marc"               -> "@marc:${SERVER_DOMAIN}"
+#   "@marc"              -> "@marc:${SERVER_DOMAIN}"
+#   "@marc:example.org"  -> unveraendert
+normalize_user_id() {
+  local input="$1"
+  input="$(echo "$input" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  [[ -z "$input" ]] && { echo ""; return; }
+  if [[ "$input" == *:* ]]; then
+    # Ggf. fehlendes @ ergaenzen
+    [[ "$input" != @* ]] && input="@$input"
+    echo "$input"
+  else
+    local localpart="${input#@}"
+    echo "@${localpart}:${SERVER_DOMAIN}"
+  fi
+}
+
+# bot_get_direct_map: liest die m.direct Account-Data des Bots und gibt das
+# JSON-Object zurueck. Bei 404 (noch nie gesetzt) wird "{}" geliefert.
+bot_get_direct_map() {
+  local encoded_user url response status body
+  encoded_user=$(url_encode_one "$BOT_USER_ID")
+  url="${HOMESERVER_URL}/_matrix/client/v3/user/${encoded_user}/account_data/m.direct"
+  response=$(http_request GET "$url" "Authorization: Bearer ${BOT_ACCESS_TOKEN}")
+  status=$(echo "$response" | head -n1)
+  body=$(echo "$response" | tail -n +2)
+  case "$status" in
+    200) echo "$body" ;;
+    404) echo "{}" ;;
+    *)
+      log_warn "m.direct-Lesen unerwarteter Status $status — nehme leeres Mapping an."
+      echo "{}" ;;
+  esac
+}
+
+# bot_user_has_dm <user_mxid>: prueft im Bot's m.direct-Mapping, ob es schon
+# einen DM-Raum mit diesem User gibt. Gibt 0 zurueck wenn ja, 1 wenn nein.
+bot_user_has_dm() {
+  local target="$1"
+  local map count
+  map=$(bot_get_direct_map)
+  count=$(echo "$map" | jq --arg u "$target" '(.[$u] // []) | length' 2>/dev/null || echo "0")
+  [[ "$count" -gt 0 ]]
+}
+
+# bot_create_dm_room <user_mxid>: erstellt einen DM-Raum, gibt room_id auf stdout.
+# Setzt einen Fehler-Exit, wenn der Server den Raum nicht erstellt.
+bot_create_dm_room() {
+  local target="$1"
+  local payload response status body room_id
+  payload=$(jq -n --arg u "$target" \
+    '{ preset: "trusted_private_chat",
+       is_direct: true,
+       visibility: "private",
+       invite: [ $u ] }')
+  response=$(http_request POST "${HOMESERVER_URL}/_matrix/client/v3/createRoom" \
+    "-d=$payload" \
+    "Authorization: Bearer ${BOT_ACCESS_TOKEN}")
+  status=$(echo "$response" | head -n1)
+  body=$(echo "$response" | tail -n +2)
+  if [[ "$status" != "200" ]]; then
+    log_error "Raum-Erstellung fehlgeschlagen (HTTP $status)."
+    echo "  Antwort: $body" >&2
+    fatal "Pruefe Bot-Token und User-ID."
+  fi
+  room_id=$(json_get "$body" '.room_id')
+  [[ -z "$room_id" ]] && fatal "Kein room_id in der Antwort gefunden."
+  echo "$room_id"
+}
+
+# bot_update_direct_map <user_mxid> <room_id>: liest m.direct, fuegt den neuen
+# Raum unter dem User-Key hinzu (oder erstellt den Eintrag) und schreibt zurueck.
+bot_update_direct_map() {
+  local target="$1"
+  local room_id="$2"
+  local map new_map encoded_user url payload response status body
+  map=$(bot_get_direct_map)
+  new_map=$(echo "$map" | jq --arg u "$target" --arg r "$room_id" \
+    '. + {($u): ((.[$u] // []) + [$r] | unique)}')
+
+  encoded_user=$(url_encode_one "$BOT_USER_ID")
+  url="${HOMESERVER_URL}/_matrix/client/v3/user/${encoded_user}/account_data/m.direct"
+  response=$(http_request PUT "$url" "-d=$new_map" \
+    "Authorization: Bearer ${BOT_ACCESS_TOKEN}")
+  status=$(echo "$response" | head -n1)
+  body=$(echo "$response" | tail -n +2)
+  if [[ "$status" != "200" ]]; then
+    log_warn "m.direct-Update fehlgeschlagen (HTTP $status). Der Raum wurde trotzdem angelegt."
+    echo "  Antwort: $body" >&2
+    return 1
+  fi
+}
+
+# bot_send_message <room_id> <text>: schickt eine m.room.message vom Bot.
+bot_send_message() {
+  local room_id="$1"
+  local text="$2"
+  local txn payload encoded_room url response status body
+  # Eindeutige Transaktions-ID — Matrix verlangt das, sonst Replay-Schutz.
+  txn="mrb-$(openssl rand -hex 8)"
+  payload=$(jq -n --arg b "$text" '{msgtype:"m.text", body:$b}')
+  encoded_room=$(url_encode_one "$room_id")
+  url="${HOMESERVER_URL}/_matrix/client/v3/rooms/${encoded_room}/send/m.room.message/${txn}"
+  response=$(http_request PUT "$url" "-d=$payload" \
+    "Authorization: Bearer ${BOT_ACCESS_TOKEN}")
+  status=$(echo "$response" | head -n1)
+  body=$(echo "$response" | tail -n +2)
+  if [[ "$status" != "200" ]]; then
+    log_warn "Begruessungsnachricht konnte nicht gesendet werden (HTTP $status)."
+    echo "  Antwort: $body" >&2
+    return 1
+  fi
+}
+
+# default_dm_message: liefert einen Standard-Text fuer den Bot.
+default_dm_message() {
+  local name="${BOT_DISPLAYNAME:-$BOT_LOCALPART}"
+  echo "Hallo! Ich bin ${name} und wurde gerade per matrix-register-bot eingerichtet. Wenn du diese Nachricht siehst, klappt unser DM."
+}
+
+# dm_with_user <user_mxid>: legt einen DM zum User an inkl. Konflikt-Check,
+# m.direct-Update und optionaler Begruessung. Gibt 0 zurueck bei Erfolg,
+# 1 bei Skip (z.B. existierender DM und non-interactive).
+dm_with_user() {
+  local raw="$1"
+  local target
+  target=$(normalize_user_id "$raw")
+
+  # MXID-Form pruefen — soll @local:domain matchen.
+  if [[ ! "$target" =~ ^@[a-z0-9._=/-]+:[a-zA-Z0-9.-]+$ ]]; then
+    log_error "Ungueltige Matrix-ID: '$raw' (normalisiert: '$target')"
+    return 1
+  fi
+
+  # Idempotenz: gibt's schon einen DM mit dem User?
+  if bot_user_has_dm "$target"; then
+    log_warn "Es existiert bereits ein DM zwischen ${BOT_USER_ID} und ${target}."
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+      log_info "Skipped (non-interactive)."
+      return 1
+    fi
+    if ! ask_yes_no "Trotzdem einen neuen DM-Raum anlegen?" "n"; then
+      log_info "OK, kein zweiter DM."
+      return 1
+    fi
+  fi
+
+  log_info "Erstelle DM-Raum mit ${target}..."
+  local room_id
+  room_id=$(bot_create_dm_room "$target")
+  log_ok "Raum angelegt: ${room_id}"
+
+  bot_update_direct_map "$target" "$room_id" \
+    && log_ok "m.direct aktualisiert (Client erkennt den Raum als DM)." || true
+
+  if [[ "$DM_NO_MESSAGE" != "true" ]]; then
+    local text="${DM_MESSAGE:-$(default_dm_message)}"
+    if bot_send_message "$room_id" "$text"; then
+      log_ok "Begruessungsnachricht gesendet."
+    fi
+  fi
+
+  log_info "Wichtig: ${target} muss die Einladung in seinem Matrix-Client annehmen."
+}
+
+# =============================================================================
 #  Subcommand: register
 # =============================================================================
 
@@ -1174,8 +1361,55 @@ step_13_maubot() {
   fi
 }
 
-step_14_summary() {
-  step_header 14 "Fertig — Zusammenfassung"
+step_14_direct_messages() {
+  step_header 14 "Direkt-Chats anlegen (optional)"
+  explain \
+    "Der Bot kann jetzt einen DM-Raum mit einem oder mehreren Usern erstellen." \
+    "So hast du sofort einen 1-zu-1-Chat mit dem neuen Bot. Du gibst eine oder" \
+    "mehrere Matrix-IDs an (kommasepariert), z.B.:" \
+    "  @marc:${SERVER_DOMAIN:-example.org}" \
+    "  marc                       (Kurzform — wird zu @marc:${SERVER_DOMAIN:-example.org})" \
+    "Der Bot legt pro User EINEN DM-Raum an und schickt eine Begruessung." \
+    "Die Einladung musst du in deinem Matrix-Client noch annehmen."
+
+  # Bereits per --dm gegeben? Sonst interaktiv fragen.
+  if [[ ${#DMS[@]} -eq 0 && "$NON_INTERACTIVE" == "false" ]]; then
+    local input
+    input=$(ask "User-MXIDs (leer = ueberspringen)" "")
+    if [[ -n "$input" ]]; then
+      IFS=',' read -r -a DMS <<<"$input"
+    fi
+  fi
+
+  if [[ ${#DMS[@]} -eq 0 ]]; then
+    log_info "Kein DM angelegt."
+    return 0
+  fi
+
+  # Begruessungstext optional interaktiv anpassen (nur wenn nicht via Flag/no-message).
+  if [[ "$DM_NO_MESSAGE" != "true" && -z "$DM_MESSAGE" && "$NON_INTERACTIVE" == "false" ]]; then
+    local default_text
+    default_text=$(default_dm_message)
+    echo "  Default-Begruessung: \"${default_text}\""
+    if ask_yes_no "Eigenen Begruessungstext eingeben?" "n"; then
+      DM_MESSAGE=$(ask "Text" "")
+      [[ -z "$DM_MESSAGE" ]] && DM_NO_MESSAGE="true"
+    fi
+  fi
+
+  local target failed=0
+  for target in "${DMS[@]}"; do
+    if ! dm_with_user "$target"; then
+      failed=$((failed + 1))
+    fi
+  done
+  if (( failed > 0 )); then
+    log_warn "${failed} von ${#DMS[@]} DM-Erstellungen uebersprungen/fehlgeschlagen."
+  fi
+}
+
+step_15_summary() {
+  step_header 15 "Fertig — Zusammenfassung"
   printf '\n%sBot angelegt:%s\n' "$C_BOLD" "$C_RESET"
   printf '  Matrix-ID:       %s\n' "$BOT_USER_ID"
   printf '  Displayname:     %s\n' "${BOT_DISPLAYNAME:-(none)}"
@@ -1194,6 +1428,7 @@ step_14_summary() {
 EOF
   printf '%sWeitere Befehle:%s\n' "$C_BOLD" "$C_RESET"
   printf '  %s invite %s <raum1> <raum2>     # Bot in weitere Raeume joinen\n' "$0" "$BOT_LOCALPART"
+  printf '  %s dm %s @marc:domain            # DM mit User starten\n' "$0" "$BOT_LOCALPART"
   printf '  %s rotate-token %s               # neuen Token holen\n' "$0" "$BOT_LOCALPART"
   printf '  %s maubot-add %s                 # Bot in maubot eintragen\n' "$0" "$BOT_LOCALPART"
   printf '  %s maubot-remove %s              # Bot aus maubot entfernen\n' "$0" "$BOT_LOCALPART"
@@ -1218,7 +1453,8 @@ cmd_register() {
   step_11_save_credentials
   step_12_rooms
   step_13_maubot
-  step_14_summary
+  step_14_direct_messages
+  step_15_summary
 }
 
 # =============================================================================
@@ -1258,6 +1494,40 @@ cmd_invite() {
     log_warn "${failed} von ${#ROOMS[@]} Raeumen fehlgeschlagen."
     exit 2
   fi
+}
+
+# =============================================================================
+#  Subcommand: dm
+# =============================================================================
+
+cmd_dm() {
+  banner
+  require_tools
+  [[ -n "$BOT_LOCALPART" ]] || fatal "Bot-Localpart fehlt. Aufruf: dm <bot> <user>..."
+  [[ ${#DMS[@]} -gt 0 ]]    || fatal "Mindestens einen User angeben. Aufruf: dm <bot> <user>..."
+
+  section_header "Direkt-Chat mit User starten"
+  explain \
+    "Wir laden die Bot-Config und der Bot legt fuer jeden angegebenen User" \
+    "einen 1-zu-1-DM an, taggt ihn als m.direct und sendet (sofern nicht" \
+    "--dm-no-message) eine Begruessungsnachricht. Der User muss die Einladung" \
+    "in seinem Matrix-Client annehmen."
+
+  read_config "$BOT_LOCALPART"
+  check_server_reachable
+
+  local target failed=0
+  for target in "${DMS[@]}"; do
+    if ! dm_with_user "$target"; then
+      failed=$((failed + 1))
+    fi
+  done
+
+  if (( failed > 0 )); then
+    log_warn "${failed} von ${#DMS[@]} DM-Erstellungen uebersprungen/fehlgeschlagen."
+    exit 2
+  fi
+  log_ok "Alle DMs angelegt."
 }
 
 # =============================================================================
@@ -1400,6 +1670,7 @@ ${SCRIPT_NAME} ${SCRIPT_VERSION}
 Verwendung:
   $0 [register] [optionen]            # Default: neuen Bot registrieren
   $0 invite <bot> <raum> [<raum>...]  # Bot in Raeume joinen (Admin force-join)
+  $0 dm <bot> <user> [<user>...]      # Direkt-Chat mit einem oder mehreren Usern
   $0 rotate-token <bot>               # Neuen Access-Token holen
   $0 deactivate <bot> [--erase]       # Bot deaktivieren
   $0 maubot-add <bot>                 # Bot als Client in maubot eintragen
@@ -1421,6 +1692,9 @@ Optionen fuer 'register':
   --generate-password            Zufaelliges Passwort erzeugen
   --rooms "r1,r2,..."            Raeume zum Auto-Join (kommasepariert)
   --no-maubot                    maubot-Schritt im register-Flow auslassen
+  --dm "@u1:dom,@u2:dom"         User, mit denen ein DM-Raum erstellt wird
+  --dm-message TEXT              Eigene Begruessungsnachricht (statt Default)
+  --dm-no-message                Keine Begruessungsnachricht senden
 
 Optionen fuer 'deactivate':
   --erase                        Profil-Daten zusaetzlich loeschen (irreversibel)
@@ -1457,6 +1731,10 @@ Beispiele:
 
   # Bot spaeter in einen Raum joinen:
   $0 invite wetterbot "#meldungen:example.org" --admin-user alice --admin-pass ...
+
+  # Direkt-Chat mit User starten (Bot leitet ein):
+  $0 dm wetterbot @marc:example.org
+  $0 dm wetterbot marc anna                  # Kurzformen, gleicher HS
 
   # Token erneuern (kein Admin-Token noetig — Bot-Passwort steht in der Config):
   $0 rotate-token wetterbot --server https://matrix.example.org
@@ -1522,6 +1800,11 @@ parse_flags() {
                              MAUBOT_HOMESERVER_OVERRIDE="${MAUBOT_HOMESERVER_OVERRIDE%/}"
                              shift ;;
       --no-maubot)           SKIP_MAUBOT="true"; shift ;;
+      --dm)                  IFS=',' read -r -a __tmp_dms <<<"$2"; DMS+=("${__tmp_dms[@]}"); unset __tmp_dms; shift 2 ;;
+      --dm=*)                IFS=',' read -r -a __tmp_dms <<<"${1#*=}"; DMS+=("${__tmp_dms[@]}"); unset __tmp_dms; shift ;;
+      --dm-message)          DM_MESSAGE="$2"; shift 2 ;;
+      --dm-message=*)        DM_MESSAGE="${1#*=}"; shift ;;
+      --dm-no-message)       DM_NO_MESSAGE="true"; shift ;;
       -h|--help)             usage; exit 0 ;;
       --)                    shift; while [[ $# -gt 0 ]]; do REMAINING_ARGS+=("$1"); shift; done ;;
       --*)                   fatal "Unbekanntes Flag: $1" ;;
@@ -1543,6 +1826,16 @@ parse_flags() {
       if [[ ${#REMAINING_ARGS[@]} -gt 0 ]]; then
         # Restliche Pos-Args + die per --rooms gesetzten kombinieren.
         ROOMS+=("${REMAINING_ARGS[@]}")
+      fi
+      ;;
+    dm)
+      # Erstes Pos-Arg = Bot, der Rest = User-MXIDs.
+      if [[ ${#REMAINING_ARGS[@]} -gt 0 && -z "$BOT_LOCALPART" ]]; then
+        BOT_LOCALPART="${REMAINING_ARGS[0]}"
+        REMAINING_ARGS=("${REMAINING_ARGS[@]:1}")
+      fi
+      if [[ ${#REMAINING_ARGS[@]} -gt 0 ]]; then
+        DMS+=("${REMAINING_ARGS[@]}")
       fi
       ;;
     rotate-token|deactivate|maubot-add|maubot-remove)
@@ -1569,7 +1862,7 @@ main() {
   local subcommand="register"
   if [[ $# -gt 0 ]]; then
     case "$1" in
-      register|invite|rotate-token|deactivate|maubot-add|maubot-remove)
+      register|invite|dm|rotate-token|deactivate|maubot-add|maubot-remove)
         subcommand="$1"; shift ;;
       help|--help|-h)
         usage; exit 0 ;;
@@ -1588,6 +1881,7 @@ main() {
   case "$subcommand" in
     register)      cmd_register ;;
     invite)        cmd_invite ;;
+    dm)            cmd_dm ;;
     rotate-token)  cmd_rotate_token ;;
     deactivate)    cmd_deactivate ;;
     maubot-add)    cmd_maubot_add ;;
