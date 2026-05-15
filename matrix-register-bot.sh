@@ -59,11 +59,15 @@ ROOMS=()                 # Raeume zum Auto-Join (Room-IDs ! oder Aliases #)
 ERASE_DATA="false"       # deactivate: GDPR-style erase?
 
 # maubot-State
-MAUBOT_URL=""            # z.B. https://maubot.example.org (ohne trailing /)
-MAUBOT_TOKEN=""          # Bearer-Token fuer die maubot Management-API
-MAUBOT_REPLACE="false"   # true = bestehenden Client ohne Frage ueberschreiben
-SKIP_MAUBOT="false"      # true = maubot-Schritt im register-Flow auslassen
-MAUBOT_NO_SAVE="false"   # true = neuen Token nicht in maubot.env schreiben
+MAUBOT_URL=""                 # z.B. https://maubot.example.org (ohne trailing /)
+MAUBOT_TOKEN=""               # Bearer-Token fuer die maubot Management-API
+MAUBOT_REPLACE="false"        # true = bestehenden Client ohne Frage ueberschreiben
+SKIP_MAUBOT="false"           # true = maubot-Schritt im register-Flow auslassen
+MAUBOT_NO_SAVE="false"        # true = neuen Token nicht in maubot.env schreiben
+MAUBOT_HOMESERVER_OVERRIDE="" # Optional: andere HS-URL, die NUR maubot benutzt
+                              # (typisch http://synapse:8008 wenn maubot+synapse
+                              # im selben docker-compose laufen). Skript-Aufrufe
+                              # gegen Synapse nutzen weiterhin HOMESERVER_URL.
 
 # =============================================================================
 #  UI-Helfer: Farben, Logs, Prompts
@@ -524,6 +528,8 @@ read_maubot_config() {
       case "$key" in
         MAUBOT_URL)   [[ -z "$MAUBOT_URL"   ]] && MAUBOT_URL="$value" ;;
         MAUBOT_TOKEN) [[ -z "$MAUBOT_TOKEN" ]] && MAUBOT_TOKEN="$value" ;;
+        MAUBOT_HOMESERVER_OVERRIDE)
+          [[ -z "$MAUBOT_HOMESERVER_OVERRIDE" ]] && MAUBOT_HOMESERVER_OVERRIDE="$value" ;;
       esac
     fi
   done < "$MAUBOT_CONFIG_FILE"
@@ -547,6 +553,10 @@ write_maubot_config() {
 
 MAUBOT_URL="${MAUBOT_URL}"
 MAUBOT_TOKEN="${MAUBOT_TOKEN}"
+# Optionaler Homeserver-Override fuer Container-Setups:
+# Wenn gesetzt, traegt das Skript diesen Wert in maubots Client-Eintrag ein,
+# statt die Skript-eigene Homeserver-URL. Leer = keine Sonderbehandlung.
+MAUBOT_HOMESERVER_OVERRIDE="${MAUBOT_HOMESERVER_OVERRIDE}"
 EOF
   chmod 600 "$MAUBOT_CONFIG_FILE"
   log_ok "maubot-Config gespeichert: ${MAUBOT_CONFIG_FILE}"
@@ -610,13 +620,24 @@ maubot_get_client() {
 # Nutzt die globalen Bot-Werte (BOT_USER_ID, HOMESERVER_URL, BOT_ACCESS_TOKEN,
 # BOT_DEVICE_ID, BOT_DISPLAYNAME).
 maubot_put_client() {
-  local encoded url payload response status body
+  local encoded url payload response status body hs_url
   encoded=$(url_encode_one "$BOT_USER_ID")
+
+  # Wenn ein Override gesetzt ist, traegt maubot DIESE URL im Client ein.
+  # Hintergrund: bei Container-Setups (maubot+synapse im selben compose) ist
+  # die interne URL z.B. http://synapse:8008, waehrend das Skript vom Host
+  # ueber https://matrix.example.org redet.
+  if [[ -n "$MAUBOT_HOMESERVER_OVERRIDE" ]]; then
+    hs_url="$MAUBOT_HOMESERVER_OVERRIDE"
+    log_info "Verwende maubot-spezifische Homeserver-URL: ${hs_url}"
+  else
+    hs_url="$HOMESERVER_URL"
+  fi
 
   # JSON-Body: alle Felder, die maubot fuer einen funktionalen Client braucht.
   # sync/autojoin/enabled/online sind die typischen Bot-Defaults.
   payload=$(jq -n \
-    --arg hs "$HOMESERVER_URL" \
+    --arg hs "$hs_url" \
     --arg tok "$BOT_ACCESS_TOKEN" \
     --arg dev "$BOT_DEVICE_ID" \
     --arg dn "$BOT_DISPLAYNAME" \
@@ -685,6 +706,40 @@ ensure_maubot_url() {
   fi
 }
 
+# ensure_maubot_homeserver_override: fragt EINMALIG beim Erstkonfig, ob maubot
+# eine andere Homeserver-URL benutzen soll als das Skript (z.B. Docker-internes
+# http://synapse:8008). Persistiert in maubot.env. Wenn dort schon ein Eintrag
+# existiert (auch leer = "bewusst nicht setzen"), wird nicht erneut gefragt.
+ensure_maubot_homeserver_override() {
+  # Per Flag schon gesetzt -> akzeptieren, fertig.
+  [[ -n "$MAUBOT_HOMESERVER_OVERRIDE" ]] && return 0
+
+  # maubot.env existiert? Dann hat der User die Frage beim Setup beantwortet.
+  # (Wenn er damals "nein" gesagt hat, steht das Feld leer in der Datei drin.)
+  [[ -f "$MAUBOT_CONFIG_FILE" ]] && return 0
+
+  # In non-interactive nichts fragen — Skript benutzt dann automatisch die
+  # normale HOMESERVER_URL.
+  [[ "$NON_INTERACTIVE" == "true" ]] && return 0
+
+  explain \
+    "Wenn maubot in einem Container laeuft und der Synapse-Container im selben" \
+    "compose-Netz steht, sollte maubot den HS NICHT ueber die externe URL" \
+    "(z.B. https://matrix.example.org) ansprechen, sondern intern — typisch:" \
+    "  http://synapse:8008" \
+    "Das gilt NUR fuer maubots eigenen Sync mit dem HS. Das Skript selbst" \
+    "redet weiterhin ueber die normale Homeserver-URL mit Synapse."
+  if ask_yes_no "maubot soll eine andere Homeserver-URL benutzen als das Skript?" "n"; then
+    while true; do
+      MAUBOT_HOMESERVER_OVERRIDE=$(ask "maubot -> Homeserver-URL" "http://synapse:8008")
+      MAUBOT_HOMESERVER_OVERRIDE="${MAUBOT_HOMESERVER_OVERRIDE%/}"
+      [[ "$MAUBOT_HOMESERVER_OVERRIDE" =~ ^https?://[a-zA-Z0-9_.-]+(:[0-9]+)?$ ]] && break
+      log_warn "Das sieht nicht wie eine gueltige URL aus."
+    done
+    log_info "maubot wird HS-URL '${MAUBOT_HOMESERVER_OVERRIDE}' eingetragen bekommen."
+  fi
+}
+
 # ensure_maubot_token: stellt sicher, dass MAUBOT_TOKEN gueltig ist. Reihenfolge:
 #   1. Wenn schon gesetzt -> ping zur Verifikation, ggf. invalidieren
 #   2. Aus maubot.env laden -> ping
@@ -737,7 +792,10 @@ ensure_maubot_token() {
     maubot_login "$user" "$pass"
   fi
 
-  # Token speichern (sofern nicht --maubot-no-save).
+  # Erstkonfig: gleich auch klaeren, ob maubot eine andere HS-URL braucht.
+  ensure_maubot_homeserver_override
+
+  # Token (+ ggf. Override) speichern (sofern nicht --maubot-no-save).
   if [[ "$MAUBOT_NO_SAVE" != "true" ]]; then
     if ask_yes_no "maubot-URL und -Token persistent speichern (chmod 600)?" "y"; then
       write_maubot_config
@@ -1368,20 +1426,25 @@ Optionen fuer 'deactivate':
   --erase                        Profil-Daten zusaetzlich loeschen (irreversibel)
 
 maubot-Optionen (fuer register, maubot-add, maubot-remove):
-  --maubot-url URL               Maubot-URL (z.B. https://maubot.example.org)
+  --maubot-url URL               Maubot-Mgmt-URL (z.B. https://maubot.example.org)
   --maubot-token TOKEN           Maubot-Management-Token (Bearer)
+  --maubot-homeserver-url URL    Andere HS-URL, die maubot intern benutzt
+                                 (z.B. http://synapse:8008 bei Compose-Setup).
+                                 Nur fuer maubots Client-Eintrag — nicht fuer
+                                 die Skript-eigenen Synapse-Aufrufe.
   --maubot-replace               Bestehenden Client ohne Frage ueberschreiben
   --maubot-no-save               Token NICHT in ${MAUBOT_CONFIG_FILE} speichern
 
   Hinweis: Beim ersten Mal kannst du den Token interaktiv per einmaligem
-  Username/Passwort-Login holen. URL und Token werden danach in
-  ${MAUBOT_CONFIG_FILE} (chmod 600) abgelegt und automatisch wiederverwendet.
+  Username/Passwort-Login holen. URL, Token und optionaler HS-Override werden
+  danach in ${MAUBOT_CONFIG_FILE} (chmod 600) abgelegt und automatisch
+  wiederverwendet.
 
 Beispiele:
   # Interaktiv (empfohlen beim ersten Mal):
   $0
 
-  # Non-interaktiv komplett (inkl. maubot):
+  # Non-interaktiv komplett (inkl. maubot, mit Container-Override):
   $0 register --server https://matrix.example.org \\
               --admin-token \$ADMIN_TOKEN \\
               --bot wetterbot --displayname "Wetter Bot" \\
@@ -1389,6 +1452,7 @@ Beispiele:
               --rooms "#general:example.org,!abc123:example.org" \\
               --maubot-url https://maubot.example.org \\
               --maubot-token \$MAUBOT_TOKEN \\
+              --maubot-homeserver-url http://synapse:8008 \\
               --non-interactive
 
   # Bot spaeter in einen Raum joinen:
@@ -1451,6 +1515,12 @@ parse_flags() {
       --maubot-token=*)      MAUBOT_TOKEN="${1#*=}"; shift ;;
       --maubot-replace)      MAUBOT_REPLACE="true"; shift ;;
       --maubot-no-save)      MAUBOT_NO_SAVE="true"; shift ;;
+      --maubot-homeserver-url)
+                             MAUBOT_HOMESERVER_OVERRIDE="${2%/}"; shift 2 ;;
+      --maubot-homeserver-url=*)
+                             MAUBOT_HOMESERVER_OVERRIDE="${1#*=}"
+                             MAUBOT_HOMESERVER_OVERRIDE="${MAUBOT_HOMESERVER_OVERRIDE%/}"
+                             shift ;;
       --no-maubot)           SKIP_MAUBOT="true"; shift ;;
       -h|--help)             usage; exit 0 ;;
       --)                    shift; while [[ $# -gt 0 ]]; do REMAINING_ARGS+=("$1"); shift; done ;;

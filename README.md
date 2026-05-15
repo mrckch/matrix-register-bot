@@ -203,12 +203,49 @@ Oder ohne maubot (wenn `maubot.env` existiert würde es sonst eingetragen):
 ### maubot-spezifische Flags
 
 ```
---maubot-url URL          Maubot-URL (https://maubot.example.org)
---maubot-token TOKEN      Management-Token (Bearer)
---maubot-replace          Bestehenden Client ohne Frage überschreiben
---maubot-no-save          Token NICHT in maubot.env speichern (z.B. CI)
---no-maubot               maubot-Schritt im register-Flow auslassen
+--maubot-url URL                Maubot-Mgmt-URL (https://maubot.example.org)
+--maubot-token TOKEN            Management-Token (Bearer)
+--maubot-homeserver-url URL     Andere HS-URL, die maubot intern benutzt
+                                (z.B. http://synapse:8008 bei Compose-Setup)
+--maubot-replace                Bestehenden Client ohne Frage überschreiben
+--maubot-no-save                Token NICHT in maubot.env speichern (z.B. CI)
+--no-maubot                     maubot-Schritt im register-Flow auslassen
 ```
+
+### Container-Setup: maubot und Synapse im selben docker-compose
+
+Wenn maubot als Container neben Synapse läuft, sollte maubot den Homeserver
+**intern** über das Compose-Netz erreichen (z.B. `http://synapse:8008`),
+nicht über die externe Reverse-Proxy-URL. Das spart Hairpin-NAT-Probleme,
+TLS-Last und Latenz.
+
+Das Skript läuft typischerweise vom Host und nutzt für seine eigenen
+Synapse-Aufrufe weiterhin die externe URL (`https://matrix.example.org`).
+Nur in maubots Client-Eintrag landet die interne URL — geregelt über
+`--maubot-homeserver-url` bzw. die interaktive Frage beim Erstkonfig.
+
+```bash
+./matrix-register-bot.sh register \
+  --server https://matrix.example.org \
+  --maubot-url https://maubot.example.org \
+  --maubot-homeserver-url http://synapse:8008 \
+  ...
+```
+
+Der Override wird mit in `maubot.env` persistiert — nach dem einmaligen Setup
+arbeiten alle weiteren `register` und `maubot-add`-Aufrufe automatisch mit
+dem internen Hostnamen.
+
+Beispiel `maubot.env` nach Erstkonfig:
+
+```env
+MAUBOT_URL="https://maubot.example.org"
+MAUBOT_TOKEN="..."
+MAUBOT_HOMESERVER_OVERRIDE="http://synapse:8008"
+```
+
+> **Wichtig:** Der Service-Name (`synapse`) muss dem `services:`-Key in deiner
+> `docker-compose.yml` entsprechen und maubot muss im selben Netzwerk sein.
 
 ### Wo bekomme ich den maubot-Token her?
 
@@ -262,8 +299,9 @@ Für 'deactivate':
   --erase                        Profil-Daten zusätzlich löschen (irreversibel)
 
 Für 'register', 'maubot-add', 'maubot-remove':
-  --maubot-url URL               Maubot-URL
+  --maubot-url URL               Maubot-Mgmt-URL
   --maubot-token TOKEN           Maubot-Management-Token (Bearer)
+  --maubot-homeserver-url URL    Andere HS-URL für maubot intern (Container)
   --maubot-replace               Bestehenden Client ohne Frage überschreiben
   --maubot-no-save               Token NICHT in maubot.env speichern
   --no-maubot                    (nur register) Schritt auslassen
