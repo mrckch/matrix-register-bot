@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { Icon } from "./Icon.jsx";
-import { synapseGet, synapsePost, synapsePut } from "../api.js";
+import { apiGet, apiPut, synapsePost } from "../api.js";
 import { CreateRoomTab } from "./CreateRoomTab.jsx";
 import {
   labelStyle, inputStyle, btnPrimaryStyle, btnGhostStyle, badgeStyle,
@@ -18,8 +18,8 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
   const [saving, setSaving] = useState(false);
   const [activeTab, setActiveTab] = useState("overview");
 
-  const mxid = bot.name;
-  const localpart = mxid.split(":")[0].replace("@", "");
+  const mxid = bot.mxid || bot.name;
+  const localpart = bot.localpart || mxid.split(":")[0].replace("@", "");
   const initial = (bot.displayname || localpart)[0]?.toUpperCase() || "B";
 
   async function fetchToken() {
@@ -37,7 +37,7 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
   async function fetchRooms() {
     setLoadingRooms(true);
     try {
-      const data = await synapseGet(`/v1/users/${encodeURIComponent(mxid)}/rooms`);
+      const data = await apiGet(`/bots/${encodeURIComponent(mxid)}/rooms`);
       setRooms(data.joined_rooms || []);
     } catch (e) {
       addToast("Fehler beim Laden der Räume: " + e.message, "error");
@@ -61,10 +61,10 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
   async function saveDisplayname() {
     setSaving(true);
     try {
-      await synapsePut(`/v2/users/${encodeURIComponent(mxid)}`, {
+      const updated = await apiPut(`/bots/${encodeURIComponent(mxid)}`, {
         displayname: editDisplayname,
       });
-      setBot({ ...bot, displayname: editDisplayname });
+      setBot(updated);
       setEditing(false);
       addToast("Anzeigename gespeichert!", "success");
     } catch (e) {

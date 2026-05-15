@@ -50,7 +50,7 @@ export function CreateRoomTab({ bot, config, addToast, onRoomCreated }) {
     setCreating(true);
     try {
       // 1. Get bot's access token via Admin-API (Backend reicht Admin-Token an)
-      const tokenResp = await synapsePost(`/v1/users/${encodeURIComponent(bot.name)}/login`);
+      const tokenResp = await synapsePost(`/v1/users/${encodeURIComponent((bot.mxid || bot.name))}/login`);
       const botToken = tokenResp.access_token;
 
       // 2. Build createRoom payload
@@ -67,7 +67,7 @@ export function CreateRoomTab({ bot, config, addToast, onRoomCreated }) {
       }
 
       // Power level overrides — bot is creator (100), set admins to 100
-      const userPowerLevels = { [bot.name]: 100 };
+      const userPowerLevels = { [(bot.mxid || bot.name)]: 100 };
       activeInvites.filter(s => s.admin).forEach(s => {
         userPowerLevels[s.mxid] = 100;
       });

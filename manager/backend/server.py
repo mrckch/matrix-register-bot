@@ -1,28 +1,46 @@
 """
-Matrix Bot Manager — Backend-Proxy.
+Matrix Bot Manager — Backend-Proxy + Bot-Registry.
 
 Funktion:
-  - /api/synapse/*  -> {SYNAPSE_URL}/_synapse/admin/*  (Admin-Token serverseitig)
-  - /api/client/*   -> {SYNAPSE_URL}/_matrix/client/v3/*  (Bot-Token aus Request)
-  - /api/health     -> Info (server_name aus Synapse whoami)
-  - alles andere    -> Statisches Frontend (SPA-Fallback auf index.html)
+  - /api/health           -> Info (server_name aus Synapse whoami)
+  - /api/bots             -> CRUD auf der Manager-eigenen Bot-Registry (SQLite)
+  - /api/bots/.../tokens  -> Access-Tokens pro Bot, Klartext in SQLite
+  - /api/bots/.../rooms   -> beigetretene Raeume des Bots (Synapse Admin)
+  - /api/discovery/*      -> Lookup gegen Synapse (z.B. user_type=bot fuer Import)
+  - /api/synapse/*        -> direkter Admin-API-Proxy (Admin-Token serverseitig)
+  - /api/client/*         -> direkter Client-API-Proxy (Bot-Token aus Request)
+  - alles andere          -> Statisches Frontend (SPA-Fallback auf index.html)
 
 Wichtige Architektur-Entscheidung:
   Der Admin-Token verlaesst diesen Container NIE. Das Frontend bekommt ihn
-  nie zu sehen und der Browser hat ihn nicht im localStorage. Damit kann
-  Synapse auf das interne Docker-Netz beschraenkt bleiben.
+  nie zu sehen und der Browser hat ihn nicht im localStorage.
+
+  Bots, die der Manager kennt, stehen in der SQLite-DB unter DB_PATH
+  (Default /data/manager.db). Damit sind wir unabhaengig vom Synapse-eigenen
+  user_type-Flag, das auch versehentlich auf Nicht-Bots landen kann.
 """
 
 from __future__ import annotations
 
 import os
+import secrets
+import string
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
+from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from db import (
+    add_bot, get_bot,
+    init_db, list_bots,
+    remove_bot, update_bot,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -33,20 +51,19 @@ SYNAPSE_URL = os.environ.get("SYNAPSE_URL", "").rstrip("/")
 SYNAPSE_ADMIN_TOKEN = os.environ.get("SYNAPSE_ADMIN_TOKEN", "")
 STATIC_DIR = Path(os.environ.get("STATIC_DIR", "/app/static"))
 
-# Header, die wir aus dem Client-Request NICHT weiterreichen — bestimmte
-# hop-by-hop-Header bzw. Header, die den Backend-Call kaputt machen wuerden.
 _FORWARD_REQUEST_BLOCKLIST = {
     "host", "connection", "content-length", "transfer-encoding",
-    "accept-encoding",  # uvicorn/httpx setzen das selbst
+    "accept-encoding",
 }
-# Header, die wir aus der Synapse-Response NICHT zurueckgeben (hop-by-hop).
 _FORWARD_RESPONSE_BLOCKLIST = {
     "transfer-encoding", "content-encoding", "connection", "keep-alive",
 }
 
+ADMIN_HEADERS = {"Authorization": f"Bearer {SYNAPSE_ADMIN_TOKEN}"} if SYNAPSE_ADMIN_TOKEN else {}
+
 
 # ---------------------------------------------------------------------------
-# Lifecycle: gemeinsamer httpx-Client pro App-Instanz
+# Lifecycle
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
@@ -57,6 +74,7 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("SYNAPSE_ADMIN_TOKEN is not set")
     timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=5.0)
     app.state.http = httpx.AsyncClient(timeout=timeout)
+    await init_db()
     try:
         yield
     finally:
@@ -67,22 +85,51 @@ app = FastAPI(lifespan=lifespan, title="Matrix Bot Manager")
 
 
 # ---------------------------------------------------------------------------
-# Health / Info
+# Helpers
 # ---------------------------------------------------------------------------
 
+def _server_name_from_mxid(mxid: str) -> str:
+    return mxid.split(":", 1)[1] if ":" in mxid else ""
+
+
+def _localpart_from_mxid(mxid: str) -> str:
+    return mxid.split(":", 1)[0].lstrip("@") if ":" in mxid else mxid
+
+
+def _q(s: str) -> str:
+    """URL-Path-Encoder, der auch '@' und ':' kodiert (in MXIDs noetig)."""
+    return quote(s, safe="")
+
+
+async def _admin_get(http: httpx.AsyncClient, path: str, params: dict | None = None) -> httpx.Response:
+    return await http.get(f"{SYNAPSE_URL}{path}", headers=ADMIN_HEADERS, params=params)
+
+
+async def _admin_put(http: httpx.AsyncClient, path: str, body: dict) -> httpx.Response:
+    return await http.put(f"{SYNAPSE_URL}{path}", headers=ADMIN_HEADERS, json=body)
+
+
+async def _admin_post(http: httpx.AsyncClient, path: str, body: dict | None = None) -> httpx.Response:
+    return await http.post(f"{SYNAPSE_URL}{path}", headers=ADMIN_HEADERS, json=body or {})
+
+
+def _gen_password(n: int = 32) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(n))
+
+
 async def _resolve_server_name(http: httpx.AsyncClient) -> str:
-    """Frage Synapse selbst nach dem server_name (aus whoami des Admin-Tokens)."""
     r = await http.get(
         f"{SYNAPSE_URL}/_matrix/client/v3/account/whoami",
-        headers={"Authorization": f"Bearer {SYNAPSE_ADMIN_TOKEN}"},
+        headers=ADMIN_HEADERS,
     )
     r.raise_for_status()
-    user_id = r.json().get("user_id", "")
-    # @admin:matrix.example.com -> matrix.example.com
-    if ":" in user_id:
-        return user_id.split(":", 1)[1]
-    return ""
+    return _server_name_from_mxid(r.json().get("user_id", ""))
 
+
+# ---------------------------------------------------------------------------
+# /api/health
+# ---------------------------------------------------------------------------
 
 @app.get("/api/health")
 async def health(request: Request):
@@ -94,7 +141,164 @@ async def health(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Proxy-Routen
+# /api/bots — Registry
+# ---------------------------------------------------------------------------
+
+class BotCreate(BaseModel):
+    localpart: str = Field(..., min_length=1)
+    displayname: str | None = None
+
+
+class BotImport(BaseModel):
+    mxid: str = Field(..., min_length=3)
+
+
+class BotUpdate(BaseModel):
+    displayname: str | None = None
+
+
+async def _enrich_bot(http: httpx.AsyncClient, bot: dict[str, Any]) -> dict[str, Any]:
+    """Manager-Registry-Eintrag mit Live-Daten aus Synapse anreichern."""
+    r = await _admin_get(http, f"/_synapse/admin/v2/users/{_q(bot['mxid'])}")
+    if r.status_code == 200:
+        synapse = r.json()
+        bot["displayname"] = synapse.get("displayname") or bot.get("displayname")
+        bot["deactivated"] = bool(synapse.get("deactivated"))
+        bot["admin"] = bool(synapse.get("admin"))
+        bot["creation_ts"] = synapse.get("creation_ts")
+        bot["user_type"] = synapse.get("user_type")
+        bot["exists_in_synapse"] = True
+    else:
+        bot["exists_in_synapse"] = False
+    return bot
+
+
+@app.get("/api/bots")
+async def api_list_bots(request: Request):
+    bots = await list_bots()
+    enriched = []
+    for b in bots:
+        enriched.append(await _enrich_bot(request.app.state.http, b))
+    return {"bots": enriched}
+
+
+@app.post("/api/bots", status_code=201)
+async def api_create_bot(payload: BotCreate, request: Request):
+    http = request.app.state.http
+    server_name = await _resolve_server_name(http)
+    localpart = payload.localpart.strip().lstrip("@").lower()
+    if not localpart:
+        raise HTTPException(400, "localpart darf nicht leer sein")
+    mxid = f"@{localpart}:{server_name}"
+
+    if await get_bot(mxid):
+        raise HTTPException(409, f"Bot {mxid} ist bereits in der Registry")
+
+    r = await _admin_put(http, f"/_synapse/admin/v2/users/{_q(mxid)}", {
+        "displayname": payload.displayname or localpart,
+        "user_type": "bot",
+        "password": _gen_password(),
+    })
+    if r.status_code not in (200, 201):
+        raise HTTPException(r.status_code, f"Synapse: {r.text}")
+
+    await add_bot(mxid, localpart, payload.displayname or localpart)
+    bot = await get_bot(mxid)
+    return await _enrich_bot(http, bot)
+
+
+@app.post("/api/bots/import", status_code=201)
+async def api_import_bot(payload: BotImport, request: Request):
+    """Bestehenden Synapse-User in die Registry uebernehmen."""
+    http = request.app.state.http
+    mxid = payload.mxid.strip()
+    if not mxid.startswith("@") or ":" not in mxid:
+        raise HTTPException(400, "MXID muss im Format @localpart:server.tld sein")
+
+    r = await _admin_get(http, f"/_synapse/admin/v2/users/{_q(mxid)}")
+    if r.status_code != 200:
+        raise HTTPException(404, f"User {mxid} existiert nicht in Synapse")
+    syn = r.json()
+
+    if await get_bot(mxid):
+        raise HTTPException(409, f"Bot {mxid} ist bereits in der Registry")
+
+    await add_bot(mxid, _localpart_from_mxid(mxid), syn.get("displayname"))
+    bot = await get_bot(mxid)
+    return await _enrich_bot(http, bot)
+
+
+@app.get("/api/bots/{mxid}")
+async def api_get_bot(mxid: str, request: Request):
+    bot = await get_bot(mxid)
+    if not bot:
+        raise HTTPException(404, f"Bot {mxid} nicht in der Registry")
+    return await _enrich_bot(request.app.state.http, bot)
+
+
+@app.put("/api/bots/{mxid}")
+async def api_update_bot(mxid: str, payload: BotUpdate, request: Request):
+    http = request.app.state.http
+    bot = await get_bot(mxid)
+    if not bot:
+        raise HTTPException(404, f"Bot {mxid} nicht in der Registry")
+    if payload.displayname is not None:
+        r = await _admin_put(http, f"/_synapse/admin/v2/users/{_q(mxid)}",
+                             {"displayname": payload.displayname})
+        if r.status_code not in (200, 201):
+            raise HTTPException(r.status_code, f"Synapse: {r.text}")
+        await update_bot(mxid, displayname=payload.displayname)
+    return await _enrich_bot(http, await get_bot(mxid))
+
+
+@app.delete("/api/bots/{mxid}")
+async def api_remove_bot(mxid: str):
+    """Entfernt den Bot NUR aus der Manager-Registry. Synapse-User bleibt."""
+    if not await get_bot(mxid):
+        raise HTTPException(404, f"Bot {mxid} nicht in der Registry")
+    await remove_bot(mxid)
+    return {"status": "removed-from-registry"}
+
+
+@app.get("/api/bots/{mxid}/rooms")
+async def api_bot_rooms(mxid: str, request: Request):
+    """Beigetretene Raeume eines Bots."""
+    if not await get_bot(mxid):
+        raise HTTPException(404, f"Bot {mxid} nicht in der Registry")
+    r = await _admin_get(request.app.state.http,
+                         f"/_synapse/admin/v1/users/{_q(mxid)}/joined_rooms")
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"Synapse: {r.text}")
+    return r.json()
+
+
+# ---------------------------------------------------------------------------
+# /api/discovery — fuer Bot-Import-Modal
+# ---------------------------------------------------------------------------
+
+@app.get("/api/discovery/synapse-users")
+async def api_discover_users(request: Request, user_type: str | None = None):
+    """Liste aller Synapse-User; optional nach user_type gefiltert.
+
+    Frontend nutzt das fuer den Import-Modal: zeigt alle Synapse-User mit
+    user_type=bot, die noch nicht in der Manager-Registry sind.
+    """
+    params = {"limit": "500"}
+    if user_type:
+        params["user_type"] = user_type
+    r = await _admin_get(request.app.state.http,
+                         "/_synapse/admin/v2/users", params=params)
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"Synapse: {r.text}")
+    data = r.json()
+    managed_mxids = {b["mxid"] for b in await list_bots()}
+    for u in data.get("users", []):
+        u["managed"] = u.get("name") in managed_mxids
+    return data
+
+
+# ---------------------------------------------------------------------------
+# /api/synapse + /api/client — generische Proxies (Altbestand, weiterhin genutzt)
 # ---------------------------------------------------------------------------
 
 def _proxy_response(upstream: httpx.Response) -> Response:
@@ -112,14 +316,11 @@ def _proxy_response(upstream: httpx.Response) -> Response:
 
 async def _proxy(request: Request, target_url: str, *, authorization: str) -> Response:
     body = await request.body()
-
-    # Original-Request-Header weitergeben, ausser Blockliste und Authorization.
     fwd_headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in _FORWARD_REQUEST_BLOCKLIST and k.lower() != "authorization"
     }
     fwd_headers["Authorization"] = authorization
-
     try:
         upstream = await request.app.state.http.request(
             method=request.method,
@@ -136,26 +337,14 @@ async def _proxy(request: Request, target_url: str, *, authorization: str) -> Re
     return _proxy_response(upstream)
 
 
-@app.api_route(
-    "/api/synapse/{path:path}",
-    methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
-)
+@app.api_route("/api/synapse/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_synapse(path: str, request: Request):
-    """Admin-API-Proxy: Admin-Token serverseitig anhaengen."""
     target = f"{SYNAPSE_URL}/_synapse/admin/{path}"
     return await _proxy(request, target, authorization=f"Bearer {SYNAPSE_ADMIN_TOKEN}")
 
 
-@app.api_route(
-    "/api/client/{path:path}",
-    methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
-)
+@app.api_route("/api/client/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_client(path: str, request: Request):
-    """Client-API-Proxy: Bot-Token kommt aus dem Request-Authorization-Header.
-
-    Frontend hat den Bot-Token vorher via /api/synapse/v1/users/{mxid}/login
-    geholt und reicht ihn beim createRoom-Call durch.
-    """
     incoming_auth = request.headers.get("authorization")
     if not incoming_auth:
         return JSONResponse(
@@ -167,16 +356,14 @@ async def proxy_client(path: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Statische Files (gebautes Frontend) + SPA-Fallback
+# Statische Files + SPA-Fallback
 # ---------------------------------------------------------------------------
 
 if STATIC_DIR.exists():
-    # StaticFiles mit html=True liefert / -> index.html
     app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets"), name="assets")
 
     @app.get("/{full_path:path}")
     async def spa_fallback(full_path: str):
-        # /api/* wird bereits weiter oben behandelt. Hier landet alles andere.
         index = STATIC_DIR / "index.html"
         if not index.exists():
             raise HTTPException(status_code=404, detail="Frontend not built")
