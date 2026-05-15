@@ -1,27 +1,22 @@
 # matrix-register-bot
 
-Interaktiver Bash-Assistent zum Anlegen von **Bot-Accounts auf einem privaten
-Synapse-Homeserver** (Matrix). Er fragt Schritt für Schritt alles ab, erklärt
-jeden Schritt in einfachem Deutsch und legt am Ende einen Bot-User samt
-eigenem Access-Token an.
+Interaktives Bash-Werkzeug zum **Verwalten von Bot-Accounts auf einem privaten
+Synapse-Homeserver** (Matrix). Führt Schritt für Schritt durch alles, was man
+sonst vergisst — und kann denselben Job auch non-interaktiv aus Skripten heraus.
 
 Ziel: Du musst dir nicht jedes Mal die Synapse-Admin-API ins Gedächtnis
-rufen, wenn du einen neuen Bot brauchst.
+rufen, wenn du einen neuen Bot brauchst, einen Token rotieren oder einen Bot
+abschalten willst.
 
-## Was das Tool macht
+## Subcommands
 
-1. Prüft, dass `curl`, `jq` und `openssl` installiert sind
-2. Fragt nach Homeserver-URL und prüft, ob der Server erreichbar ist
-3. Holt sich ein Admin-Access-Token (entweder eingeben oder per Login erzeugen)
-4. Verifiziert die Admin-Rechte gegen die Admin-API
-5. Fragt nach dem Bot-Localpart (validiert nach Matrix-Spec)
-6. Prüft, ob der User schon existiert – mit Option „nur Token erneuern"
-7. Optionaler Displayname
-8. Passwort: zufällig generieren (empfohlen) oder selbst eingeben
-9. Legt den User per `PUT /_synapse/admin/v2/users/{mxid}` an
-10. Loggt den Bot einmal ein → eigener Access-Token
-11. Speichert alles in `~/.config/matrix-register-bot/<bot>.env` (`chmod 600`)
-12. Zeigt Zusammenfassung + Quick-Test + nächste Schritte
+| Befehl | Was er macht |
+|---|---|
+| `register` (Default) | Neuen Bot anlegen, Passwort + Access-Token erzeugen, in Räume joinen |
+| `invite <bot> <raum>...` | Bestehenden Bot in (weitere) Räume joinen (Synapse Admin force-join) |
+| `rotate-token <bot>` | Mit dem gespeicherten Bot-Passwort einen neuen Access-Token holen |
+| `deactivate <bot> [--erase]` | Bot auf dem Server abschalten (optional Daten löschen) |
+| `help` | Hilfe anzeigen |
 
 ## Voraussetzungen
 
@@ -31,10 +26,9 @@ rufen, wenn du einen neuen Bot brauchst.
 sudo apt update && sudo apt install -y curl jq openssl
 ```
 
-### Auf dem Synapse-Server
+### Auf dem Synapse-Server: Ein Admin-User muss existieren
 
-Du brauchst **einen Admin-User**. Synapse erzeugt keinen „Initial-Admin" für
-dich – das musst du einmalig selbst tun. Auf dem Synapse-Host:
+Synapse erzeugt keinen „Initial-Admin" für dich. Einmalig auf dem Synapse-Host:
 
 ```bash
 sudo register_new_matrix_user \
@@ -44,20 +38,22 @@ sudo register_new_matrix_user \
 
 Beim Prompt **„Make admin? (yes/no)"** mit `yes` antworten.
 
-> Alternative: einen bestehenden User per SQL als Admin markieren:
-> `UPDATE users SET admin = 1 WHERE name = '@alice:example.org';`
+Alternative: einen bestehenden User als Admin markieren —
+`UPDATE users SET admin = 1 WHERE name = '@alice:example.org';`
 
-## Verwendung
+## Schneller Einstieg
 
 ```bash
+git clone git@github.com:mrckch/matrix-register-bot.git
+cd matrix-register-bot
 chmod +x matrix-register-bot.sh
 ./matrix-register-bot.sh
 ```
 
-Dann einfach den Prompts folgen. Bei jedem Schritt steht im grauen Block, was
-gerade passiert und warum.
+Den Prompts folgen. Bei jedem Schritt erklärt das Skript in grauer Schrift,
+was gerade passiert und warum.
 
-### Beispielsitzung
+### Beispielsitzung (interaktiv)
 
 ```
 ===== Schritt 1: Homeserver-URL eingeben =====
@@ -66,24 +62,83 @@ gerade passiert und warum.
   Homeserver-URL: https://matrix.example.org
 
 ===== Schritt 3: Admin-Zugang einrichten =====
-  Welche Option? (1/2) [2]: 2
-  Admin-Benutzername (nur Localpart, z.B. 'admin'): alice
-  Passwort des Admin-Users (wird nicht angezeigt):
-[OK] Login erfolgreich. Server-Domain erkannt: example.org
+  Auswahl (1/2) [2]: 2
+  Admin-Benutzername (Localpart): alice
+  Passwort des Admin-Users: ******
+[OK] Login erfolgreich. Server-Domain: example.org
 
 ===== Schritt 5: Bot-Benutzername (Localpart) waehlen =====
   Localpart des Bots: wetterbot
-[i] Vollstaendige Matrix-ID des Bots: @wetterbot:example.org
+[i] Vollstaendige Matrix-ID: @wetterbot:example.org
 ...
-===== Schritt 12: Fertig — Zusammenfassung =====
+===== Schritt 12: Raeume beitreten (optional) =====
+  Raeume (leer = ueberspringen): #meldungen:example.org,!abcdef:example.org
+[OK] Bot ist Raum beigetreten: #meldungen:example.org -> !xyz:example.org
+[OK] Bot ist Raum beigetreten: !abcdef:example.org -> !abcdef:example.org
+
+===== Schritt 13: Fertig — Zusammenfassung =====
 Bot angelegt:
   Matrix-ID:       @wetterbot:example.org
   Credentials in:  /home/marc/.config/matrix-register-bot/wetterbot.env
 ```
 
+## Non-interaktiv (für Automatisierung)
+
+Alle Werte als Flag mitgeben + `--non-interactive`:
+
+```bash
+./matrix-register-bot.sh register \
+  --server https://matrix.example.org \
+  --admin-token "$ADMIN_TOKEN" \
+  --bot wetterbot \
+  --displayname "Wetter Bot" \
+  --generate-password \
+  --rooms "#meldungen:example.org,!abcdef:example.org" \
+  --non-interactive
+```
+
+Statt `--admin-token` geht auch `--admin-user alice --admin-pass ...`. Achtung:
+Passwörter auf der Kommandozeile landen in der Shell-History — für reguläres
+Skripten ist Admin-Token aus einer Env-Variable die bessere Wahl.
+
+## Weitere Beispiele
+
+### Bestehenden Bot in einen neuen Raum joinen
+
+```bash
+./matrix-register-bot.sh invite wetterbot "#neuer-raum:example.org" \
+  --admin-token "$ADMIN_TOKEN"
+```
+
+Force-Join funktioniert für Räume auf dem **eigenen** Homeserver. Für
+Federation-Räume muss der Bot dort manuell eingeladen werden — joinen kann er
+sich danach selbst über den gespeicherten Token.
+
+### Access-Token rotieren
+
+Token kompromittiert oder einfach vorsichtig wechseln:
+
+```bash
+./matrix-register-bot.sh rotate-token wetterbot \
+  --server https://matrix.example.org
+```
+
+Braucht **kein** Admin-Token — das Bot-Passwort steht in der Config. Die alte
+Config wird mit Zeitstempel als `.bak` gesichert.
+
+### Bot abschalten
+
+```bash
+# Sanft: User existiert weiter, kann sich aber nicht mehr einloggen
+./matrix-register-bot.sh deactivate wetterbot --admin-token "$ADMIN_TOKEN"
+
+# Hart: zusätzlich Profil/Avatar löschen (GDPR-Style, irreversibel)
+./matrix-register-bot.sh deactivate wetterbot --admin-token "$ADMIN_TOKEN" --erase
+```
+
 ## Ergebnis-Datei
 
-Unter `~/.config/matrix-register-bot/<bot>.env` (Mode 600):
+Unter `~/.config/matrix-register-bot/<bot>.env` (Mode 600, Ordner Mode 700):
 
 ```env
 HOMESERVER_URL="https://matrix.example.org"
@@ -95,27 +150,59 @@ BOT_ACCESS_TOKEN="syt_…"
 BOT_DEVICE_ID="matrix-register-bot"
 ```
 
-In einem Bot-Framework brauchst du normalerweise nur:
+In einem Bot-Framework (matrix-nio, mautrix-go, maubot, …) brauchst du in der
+Regel nur:
 
 - `HOMESERVER_URL`
 - `BOT_USER_ID`
 - `BOT_ACCESS_TOKEN`
 
+## Flags-Übersicht
+
+```
+Gemeinsame Optionen:
+  --server URL                   Homeserver-URL (https://matrix.example.org)
+  --insecure                     TLS-Prüfung abschalten (nur eigener Server!)
+  --admin-token TOKEN            Vorhandener Admin-Access-Token
+  --admin-user LOCALPART         Admin-Benutzername (Localpart)
+  --admin-pass PASS              Admin-Passwort
+  --non-interactive              Keine Prompts, alle Werte aus Flags
+
+Für 'register':
+  --bot LOCALPART                Bot-Localpart (z.B. wetterbot)
+  --displayname NAME             Anzeigename
+  --password PASS                Passwort vorgeben
+  --generate-password            Zufälliges Passwort erzeugen
+  --rooms "r1,r2,..."            Räume zum Auto-Join (kommasepariert)
+
+Für 'deactivate':
+  --erase                        Profil-Daten zusätzlich löschen (irreversibel)
+```
+
 ## Häufige Fragen
 
 ### Selbstsigniertes TLS-Zertifikat
 
-In Schritt 1 fragt das Skript nach, ob die Zertifikatsprüfung abgeschaltet
-werden soll. Antworte mit `y`, wenn dein Server ein selbstsigniertes Zert hat.
-**Niemals** bei fremden Servern abschalten.
+`--insecure` als Flag oder im interaktiven Prompt mit „y" beantworten. Niemals
+bei fremden Servern.
 
 ### „User existiert bereits"
 
-In Schritt 6 kannst du wählen:
-
+Interaktiv wirst du gefragt:
 1. Abbrechen
 2. Passwort beibehalten, nur einen neuen Token holen
 3. Passwort und Token komplett neu setzen
+
+Non-interaktiv mit `--password` oder `--generate-password` werden Passwort und
+Token überschrieben.
+
+### Force-Join schlägt fehl
+
+Der Admin-Force-Join (`/_synapse/admin/v1/join/<raum>`) klappt nur, wenn ein
+**lokaler User** Mitglied im Zielraum ist — typisch für deinen eigenen
+Homeserver. Für Räume auf anderen Servern muss der Bot eingeladen werden;
+danach kann er sich mit `BOT_ACCESS_TOKEN` selbst per `/_matrix/client/v3/join`
+joinen.
 
 ### Access-Token später widerrufen
 
@@ -126,27 +213,17 @@ curl -X POST \
   "$HOMESERVER_URL/_matrix/client/v3/logout"
 ```
 
-### Bot wieder löschen
-
-```bash
-# Mit Admin-Token (Beispiel — Token entsprechend setzen):
-curl -X POST \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"erase": false}' \
-  "$HOMESERVER_URL/_synapse/admin/v1/deactivate/@wetterbot:example.org"
-```
-
 ## Sicherheitshinweise
 
-- Die `.env`-Dateien enthalten **Klartext-Passwörter und -Tokens**. Sie sind
-  per `chmod 600` geschützt, aber bewahre sie nicht in Sync-Ordnern (Dropbox,
-  iCloud Drive) auf.
-- **Niemals** die `.env`-Dateien committen. Die mitgelieferte `.gitignore`
-  schützt davor, aber pass auch bei manuellen Kopien auf.
-- Wenn du den Admin-Token im Skript eingibst, wird er **nicht** persistiert.
-  Wenn du dich per Admin-Login authentifizierst, wird auch der Admin-Token
-  nur im Speicher gehalten und beim Skript-Ende verworfen.
+- Die `.env`-Dateien enthalten **Klartext-Passwörter und -Tokens**. Schutz:
+  `chmod 600` (Datei) + `chmod 700` (Ordner). Nicht in Sync-Ordnern (Dropbox,
+  iCloud Drive) aufbewahren.
+- **Niemals** die `.env`-Dateien committen — die mitgelieferte `.gitignore`
+  schützt davor.
+- Admin-Token und -Passwörter werden vom Skript **nicht** persistiert — sie
+  leben nur im Prozess-Speicher und verschwinden beim Exit.
+- Bei `--admin-pass` auf der Kommandozeile: das landet in deiner Shell-History.
+  Für Automation lieber `--admin-token "$VAR"` aus einer Env-Variable lesen.
 
 ## Lizenz
 
