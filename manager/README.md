@@ -12,6 +12,10 @@ das laufende Drumherum (Token rotieren, Raeume anlegen, Bots loeschen).
 
 ## Was die UI kann
 
+- **Setup-Wizard „Bot + Raum komplett"** — Bot, Token (max. Dauer),
+  Raum (mit Topic/E2EE/öffentlich), Invites mit Per-User-Admin-Flag in
+  einem Rutsch. Orchestriert vom Backend, gibt am Ende eine Statusliste
+  pro Schritt zurück.
 - **Manager-eigene Bot-Registry** (SQLite) — unabhaengig vom Synapse-internen
   `user_type=bot`-Flag, das auch versehentlich auf Nicht-Bots landen kann
 - Bots auflisten (nur aus der Registry)

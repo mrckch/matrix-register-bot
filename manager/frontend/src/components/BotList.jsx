@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { Icon } from "./Icon.jsx";
 import { apiGet, apiPost } from "../api.js";
+import { SetupWizard } from "./SetupWizard.jsx";
 import {
   labelStyle, inputStyle, btnPrimaryStyle, btnGhostStyle, badgeStyle,
   modalOverlayStyle, modalStyle,
@@ -11,6 +12,7 @@ export function BotList({ config, onSelectBot, onOpenSettings, addToast }) {
   const [loading, setLoading] = useState(true);
   const [showCreate, setShowCreate] = useState(false);
   const [showImport, setShowImport] = useState(false);
+  const [showWizard, setShowWizard] = useState(false);
   const [newUsername, setNewUsername] = useState("");
   const [newDisplayname, setNewDisplayname] = useState("");
   const [creating, setCreating] = useState(false);
@@ -71,8 +73,11 @@ export function BotList({ config, onSelectBot, onOpenSettings, addToast }) {
           <button onClick={() => setShowImport(true)} style={btnGhostStyle} title="Bestehenden Bot importieren">
             <Icon name="download" size={15} /> Importieren
           </button>
-          <button onClick={() => setShowCreate(true)} style={btnPrimaryStyle}>
+          <button onClick={() => setShowCreate(true)} style={btnGhostStyle} title="Nur Bot anlegen, ohne Token/Raum">
             <Icon name="plus" size={15} /> Neuer Bot
+          </button>
+          <button onClick={() => setShowWizard(true)} style={btnPrimaryStyle} title="Bot + Token + Raum + Einladungen in einem Rutsch">
+            <Icon name="bot" size={15} /> Bot + Raum
           </button>
         </div>
       </div>
@@ -112,6 +117,15 @@ export function BotList({ config, onSelectBot, onOpenSettings, addToast }) {
         <ImportModal
           onClose={() => setShowImport(false)}
           onImported={() => { setShowImport(false); loadBots(); }}
+          addToast={addToast}
+        />
+      )}
+
+      {showWizard && (
+        <SetupWizard
+          config={config}
+          onClose={() => setShowWizard(false)}
+          onDone={loadBots}
           addToast={addToast}
         />
       )}

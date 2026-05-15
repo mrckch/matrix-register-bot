@@ -412,6 +412,176 @@ async def api_delete_token(mxid: str, token_id: int, request: Request):
 
 
 # ---------------------------------------------------------------------------
+# /api/wizard/setup-bot — Bot + Token + Raum + Einladungen in einem Rutsch
+# ---------------------------------------------------------------------------
+
+class WizardInvite(BaseModel):
+    mxid: str
+    power_level: int = 0  # 0 = Standard, 100 = Admin
+
+
+class WizardRoom(BaseModel):
+    name: str
+    topic: str | None = None
+    encrypted: bool = False
+    public: bool = False
+    invites: list[WizardInvite] = []
+
+
+class WizardSetup(BaseModel):
+    localpart: str
+    displayname: str | None = None
+    token_label: str | None = None
+    # None oder 0 = "nie" (~100 Jahre).
+    token_valid_for_ms: int | None = None
+    room: WizardRoom
+
+
+@app.post("/api/wizard/setup-bot")
+async def api_wizard_setup_bot(payload: WizardSetup, request: Request):
+    """Orchestriert: Bot anlegen -> Token erzeugen -> Raum als Bot anlegen
+    inkl. Invites und Power-Levels. Bei Fehler in einem Schritt werden
+    nachfolgende Schritte uebersprungen; bereits Erstelltes bleibt bestehen,
+    weil ein vollstaendiger Rollback (User loeschen) ueber die Admin-API
+    nicht sauber atomar moeglich ist.
+    """
+    http = request.app.state.http
+    steps: list[dict[str, Any]] = []
+    result: dict[str, Any] = {
+        "steps": steps, "bot": None, "token": None, "room": None,
+    }
+
+    def add_step(step_id: str, status: str, detail: str = "") -> None:
+        steps.append({"id": step_id, "status": status, "detail": detail})
+
+    def skip_remaining(remaining: list[str]) -> None:
+        for step_id in remaining:
+            add_step(step_id, "skipped", "vorheriger Schritt fehlgeschlagen")
+
+    # ----- Step 1: Bot anlegen -----
+    server_name = await _resolve_server_name(http)
+    localpart = payload.localpart.strip().lstrip("@").lower()
+    if not localpart:
+        add_step("create_bot", "error", "localpart darf nicht leer sein")
+        skip_remaining(["create_token", "create_room"])
+        return result
+    mxid = f"@{localpart}:{server_name}"
+
+    if await get_bot(mxid):
+        add_step("create_bot", "error", f"Bot {mxid} ist bereits in der Registry")
+        skip_remaining(["create_token", "create_room"])
+        return result
+
+    r = await _admin_put(http, f"/_synapse/admin/v2/users/{_q(mxid)}", {
+        "displayname": payload.displayname or localpart,
+        "user_type": "bot",
+        "password": _gen_password(),
+    })
+    if r.status_code not in (200, 201):
+        add_step("create_bot", "error", f"Synapse: {r.text}")
+        skip_remaining(["create_token", "create_room"])
+        return result
+    await add_bot(mxid, localpart, payload.displayname or localpart)
+    result["bot"] = await _enrich_bot(http, await get_bot(mxid))
+    add_step("create_bot", "ok", mxid)
+
+    # ----- Step 2: Token erzeugen -----
+    valid_for_ms = payload.token_valid_for_ms or NEVER_EXPIRES_MS
+    valid_until_ms = int(time.time() * 1000) + valid_for_ms
+
+    r = await _admin_post(http, f"/_synapse/admin/v1/users/{_q(mxid)}/login",
+                          {"valid_until_ms": valid_until_ms})
+    if r.status_code != 200:
+        add_step("create_token", "error", f"Synapse: {r.text}")
+        skip_remaining(["create_room"])
+        return result
+    access_token = r.json().get("access_token")
+    if not access_token:
+        add_step("create_token", "error", "Synapse lieferte keinen access_token")
+        skip_remaining(["create_room"])
+        return result
+
+    w = await http.get(
+        f"{SYNAPSE_URL}/_matrix/client/v3/account/whoami",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    if w.status_code != 200:
+        add_step("create_token", "error", "device_id konnte nicht ermittelt werden")
+        skip_remaining(["create_room"])
+        return result
+    device_id = w.json().get("device_id", "")
+
+    if payload.token_label:
+        # display_name-PUT ist Best-Effort: Fehler hier kippt nicht den ganzen Schritt.
+        await http.put(
+            f"{SYNAPSE_URL}/_synapse/admin/v2/users/{_q(mxid)}/devices/{_q(device_id)}",
+            headers=ADMIN_HEADERS,
+            json={"display_name": payload.token_label},
+        )
+
+    token_id = await add_token(
+        mxid=mxid, device_id=device_id, access_token=access_token,
+        label=payload.token_label, valid_until_ms=valid_until_ms,
+    )
+    result["token"] = {
+        "id": token_id, "access_token": access_token,
+        "label": payload.token_label, "valid_until_ms": valid_until_ms,
+        "device_id": device_id,
+    }
+    add_step("create_token", "ok", f"Device {device_id}")
+
+    # ----- Step 3: Raum anlegen (mit Invites und Power-Levels in einem Rutsch) -----
+    initial_state: list[dict] = []
+    if payload.room.encrypted:
+        initial_state.append({
+            "type": "m.room.encryption",
+            "state_key": "",
+            "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+        })
+
+    user_pls: dict[str, int] = {mxid: 100}  # Bot ist Creator
+    for inv in payload.room.invites:
+        if inv.power_level > 0:
+            user_pls[inv.mxid] = inv.power_level
+
+    body: dict[str, Any] = {
+        "name": payload.room.name,
+        "invite": [inv.mxid for inv in payload.room.invites],
+        "preset": "public_chat" if payload.room.public else "private_chat",
+        "visibility": "public" if payload.room.public else "private",
+        "initial_state": initial_state,
+        "power_level_content_override": {"users": user_pls},
+    }
+    if payload.room.topic:
+        body["topic"] = payload.room.topic
+
+    r = await http.post(
+        f"{SYNAPSE_URL}/_matrix/client/v3/createRoom",
+        headers={"Authorization": f"Bearer {access_token}",
+                 "Content-Type": "application/json"},
+        json=body,
+    )
+    if r.status_code != 200:
+        add_step("create_room", "error", f"Synapse: {r.text}")
+        return result
+
+    room_id = r.json().get("room_id")
+    n_invites = len(payload.room.invites)
+    n_admins = sum(1 for inv in payload.room.invites if inv.power_level >= 100)
+    detail = f"{room_id} ({n_invites} eingeladen"
+    if n_admins:
+        detail += f", {n_admins} davon Admin"
+    detail += ")"
+    result["room"] = {
+        "room_id": room_id,
+        "matrix_to": f"https://matrix.to/#/{room_id}",
+    }
+    add_step("create_room", "ok", detail)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # /api/discovery — fuer Bot-Import-Modal
 # ---------------------------------------------------------------------------
 
