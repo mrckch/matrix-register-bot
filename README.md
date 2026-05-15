@@ -1,14 +1,20 @@
 # matrix-register-bot
 
-Interaktives Bash-Werkzeug zum **Verwalten von Bot-Accounts auf einem privaten
-Synapse-Homeserver** (Matrix). Führt Schritt für Schritt durch alles, was man
-sonst vergisst — und kann denselben Job auch non-interaktiv aus Skripten heraus.
+Zwei Tools rund um Bot-Accounts auf einem privaten Synapse-Homeserver (Matrix):
+
+1. **CLI** ([`matrix-register-bot.sh`](matrix-register-bot.sh)) — interaktives
+   Bash-Werkzeug fürs Anlegen einzelner Bots, auch non-interaktiv aus Skripten.
+2. **UI** ([`manager/`](manager/)) — kleiner Container mit Web-UI fürs laufende
+   Drumherum (Bots auflisten, Token generieren, Räume anlegen). Läuft im selben
+   Docker-Stack wie Synapse, Admin-Token bleibt serverseitig.
+
+Beide nutzen ausschließlich die Synapse Admin-API + die Matrix Client-Server API.
 
 Ziel: Du musst dir nicht jedes Mal die Synapse-Admin-API ins Gedächtnis
 rufen, wenn du einen neuen Bot brauchst, einen Token rotieren oder einen Bot
 abschalten willst.
 
-## Subcommands
+## CLI: Subcommands
 
 | Befehl | Was er macht |
 |---|---|

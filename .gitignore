@@ -25,3 +25,10 @@ desktop.ini
 # --- Shellcheck / Build-Artefakte ---
 *.log
 .shellcheckrc.local
+
+# --- manager/ (Web-UI) Build- und Dependency-Artefakte ---
+manager/frontend/node_modules/
+manager/frontend/dist/
+manager/backend/__pycache__/
+manager/backend/.venv/
+manager/**/__pycache__/

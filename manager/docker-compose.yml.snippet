@@ -1,0 +1,32 @@
+# Snippet zum Erweitern deines bestehenden Matrix-Compose-Stacks.
+# Annahmen:
+#   - Synapse-Container heisst "matrix-synapse" (siehe `docker ps`) und ist
+#     im selben Compose-Stack bzw. zumindest im gleichen Docker-Netz.
+#   - Synapse hoert intern auf Port 8008 (Standard).
+# Falls die Service-Namen bei dir anders heissen, SYNAPSE_URL und das
+# externe Netz unten entsprechend anpassen.
+
+services:
+  matrix-bot-manager:
+    build:
+      context: ./manager
+    container_name: matrix-bot-manager
+    restart: unless-stopped
+    environment:
+      # Container-zu-Container — auf das Service-/Container-Name + Port des
+      # Synapse-Listeners zeigen, nicht auf die oeffentliche URL.
+      SYNAPSE_URL: "http://matrix-synapse:8008"
+      SYNAPSE_ADMIN_TOKEN: "${SYNAPSE_ADMIN_TOKEN}"
+      # PORT: 8080
+    ports:
+      # Optional — wenn du NPM/Reverse-Proxy auf einer anderen Box hast, dann
+      # exposen. Sonst kann der Port auch nur intern bleiben.
+      - "8082:8080"
+    # Wenn der Stack ein eigenes Netz hat (z.B. matrix_default), das hier
+    # verwenden, damit "matrix-synapse" als Hostname aufloesbar ist.
+    # networks:
+    #   - matrix_default
+
+# networks:
+#   matrix_default:
+#     external: true
