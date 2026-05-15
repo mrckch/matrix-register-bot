@@ -12,10 +12,12 @@ abschalten willst.
 
 | Befehl | Was er macht |
 |---|---|
-| `register` (Default) | Neuen Bot anlegen, Passwort + Access-Token erzeugen, in Räume joinen |
+| `register` (Default) | Neuen Bot anlegen, Passwort + Access-Token erzeugen, in Räume joinen, optional direkt in maubot eintragen |
 | `invite <bot> <raum>...` | Bestehenden Bot in (weitere) Räume joinen (Synapse Admin force-join) |
 | `rotate-token <bot>` | Mit dem gespeicherten Bot-Passwort einen neuen Access-Token holen |
 | `deactivate <bot> [--erase]` | Bot auf dem Server abschalten (optional Daten löschen) |
+| `maubot-add <bot>` | Bestehenden Bot als Client in eine [maubot](https://github.com/maubot/maubot)-Instanz eintragen |
+| `maubot-remove <bot>` | Bot aus der maubot-Instanz entfernen |
 | `help` | Hilfe anzeigen |
 
 ## Voraussetzungen
@@ -136,6 +138,87 @@ Config wird mit Zeitstempel als `.bak` gesichert.
 ./matrix-register-bot.sh deactivate wetterbot --admin-token "$ADMIN_TOKEN" --erase
 ```
 
+## maubot-Integration
+
+Wenn du [maubot](https://github.com/maubot/maubot) als Plugin-Bot-Framework
+betreibst, kann das Skript den frisch angelegten Bot direkt als **Client** in
+maubot eintragen. Alle nötigen Werte (Homeserver-URL, Access-Token, Device-ID,
+Displayname) hat es zu diesem Zeitpunkt sowieso schon.
+
+### Im register-Flow
+
+Direkt nach Schritt 11 (Credentials speichern) fragt der Assistent in
+Schritt 13: **„Bot jetzt in maubot eintragen?"** Bei Ja:
+
+1. Beim **ersten Mal** wird nach der maubot-URL gefragt.
+2. **Token-Bootstrap**: entweder einen vorhandenen Token eingeben *oder*
+   einmalig mit maubot-Username+Passwort einloggen — das Skript holt sich
+   dann den Token und speichert **nur den Token** (Passwort wird verworfen).
+3. URL + Token landen in `~/.config/matrix-register-bot/maubot.env`
+   (`chmod 600`) und werden bei zukünftigen Aufrufen automatisch wiederverwendet.
+4. Bot wird per `PUT /_matrix/maubot/v1/client/{mxid}` als Client eingetragen,
+   mit `sync=true`, `autojoin=true`, `enabled=true`.
+
+**Plugin-Instanzen** musst du weiterhin im maubot-Web-UI selbst anlegen
+(Clients → `@bot:domain` → **+ Instance**). Der Client ist nur die
+Account-Hülle; das eigentliche Bot-Verhalten kommt aus den Plugins.
+
+### Nachträglich oder zu einer anderen maubot-Instanz
+
+```bash
+./matrix-register-bot.sh maubot-add wetterbot
+```
+
+Lädt die gespeicherte Bot-Config + die maubot-Verbindungsdaten, prüft ob der
+Client schon existiert, und legt ihn an (oder fragt vorher).
+
+### Bot aus maubot entfernen
+
+```bash
+./matrix-register-bot.sh maubot-remove wetterbot
+```
+
+> **Hinweis**: Plugin-Instanzen, die auf diesem Client laufen, müssen vorher
+> in maubot gelöscht werden — sonst lehnt die API den DELETE ab.
+
+### Non-interaktiv mit maubot
+
+```bash
+./matrix-register-bot.sh register \
+  --server https://matrix.example.org \
+  --admin-token "$ADMIN_TOKEN" \
+  --bot wetterbot --displayname "Wetter Bot" \
+  --generate-password \
+  --maubot-url https://maubot.example.org \
+  --maubot-token "$MAUBOT_TOKEN" \
+  --non-interactive
+```
+
+Oder ohne maubot (wenn `maubot.env` existiert würde es sonst eingetragen):
+
+```bash
+./matrix-register-bot.sh register ... --no-maubot --non-interactive
+```
+
+### maubot-spezifische Flags
+
+```
+--maubot-url URL          Maubot-URL (https://maubot.example.org)
+--maubot-token TOKEN      Management-Token (Bearer)
+--maubot-replace          Bestehenden Client ohne Frage überschreiben
+--maubot-no-save          Token NICHT in maubot.env speichern (z.B. CI)
+--no-maubot               maubot-Schritt im register-Flow auslassen
+```
+
+### Wo bekomme ich den maubot-Token her?
+
+- **Web-UI**: einloggen, DevTools → Application → Local Storage → `accessToken`
+- **mbc-CLI** (offizielle maubot-CLI): `mbc login` legt den Token unter
+  `~/.config/maubot-cli.json` ab — `jq -r .servers[].token` aus der Datei lesen
+- **Einfacher**: einfach den Bootstrap-Login dieses Skripts nutzen — gib beim
+  ersten Mal Username/Passwort ein, das Skript holt den Token, speichert ihn,
+  verwirft das Passwort.
+
 ## Ergebnis-Datei
 
 Unter `~/.config/matrix-register-bot/<bot>.env` (Mode 600, Ordner Mode 700):
@@ -177,6 +260,13 @@ Für 'register':
 
 Für 'deactivate':
   --erase                        Profil-Daten zusätzlich löschen (irreversibel)
+
+Für 'register', 'maubot-add', 'maubot-remove':
+  --maubot-url URL               Maubot-URL
+  --maubot-token TOKEN           Maubot-Management-Token (Bearer)
+  --maubot-replace               Bestehenden Client ohne Frage überschreiben
+  --maubot-no-save               Token NICHT in maubot.env speichern
+  --no-maubot                    (nur register) Schritt auslassen
 ```
 
 ## Häufige Fragen

@@ -7,10 +7,12 @@
 #  vergisst:
 #
 #    register      Bot anlegen, Token erzeugen, Credentials speichern,
-#                  optional gleich in Raeume joinen
+#                  optional in Raeume joinen, optional in maubot eintragen
 #    invite        Bestehenden Bot in (weitere) Raeume joinen (Admin force-join)
 #    rotate-token  Mit gespeichertem Passwort neuen Access-Token holen
 #    deactivate    Bot auf dem Server deaktivieren
+#    maubot-add    Bot als Client in eine maubot-Instanz eintragen
+#    maubot-remove Bot aus einer maubot-Instanz entfernen
 #    help          Hilfe anzeigen
 #
 #  Zielplattform: Debian 13 (Bash >= 5, curl, jq, openssl).
@@ -28,8 +30,9 @@ IFS=$'\n\t'
 # =============================================================================
 
 readonly SCRIPT_NAME="matrix-register-bot"
-readonly SCRIPT_VERSION="0.2.0"
+readonly SCRIPT_VERSION="0.3.0"
 readonly CONFIG_DIR="${HOME}/.config/${SCRIPT_NAME}"
+readonly MAUBOT_CONFIG_FILE="${CONFIG_DIR}/maubot.env"
 
 # =============================================================================
 #  Globaler State (wird durch Flags + Prompts gefuellt)
@@ -54,6 +57,13 @@ GENERATE_PASSWORD=""     # "true"|"false"|"" — "" = nachfragen
 USER_EXISTS="false"      # wird in step_06 gesetzt
 ROOMS=()                 # Raeume zum Auto-Join (Room-IDs ! oder Aliases #)
 ERASE_DATA="false"       # deactivate: GDPR-style erase?
+
+# maubot-State
+MAUBOT_URL=""            # z.B. https://maubot.example.org (ohne trailing /)
+MAUBOT_TOKEN=""          # Bearer-Token fuer die maubot Management-API
+MAUBOT_REPLACE="false"   # true = bestehenden Client ohne Frage ueberschreiben
+SKIP_MAUBOT="false"      # true = maubot-Schritt im register-Flow auslassen
+MAUBOT_NO_SAVE="false"   # true = neuen Token nicht in maubot.env schreiben
 
 # =============================================================================
 #  UI-Helfer: Farben, Logs, Prompts
@@ -485,6 +495,293 @@ admin_force_join_one() {
 }
 
 # =============================================================================
+#  maubot-Integration
+# =============================================================================
+#
+#  maubot ist ein Plugin-basiertes Matrix-Bot-Framework. Eine maubot-Instanz
+#  verwaltet mehrere "Clients" (= Matrix-Accounts) und kann auf jedem davon
+#  Plugin-Instanzen laufen lassen.
+#
+#  Management-API:
+#    POST   /_matrix/maubot/v1/auth/login   { username, password } -> { token }
+#    POST   /_matrix/maubot/v1/auth/ping    (Token validieren)
+#    GET    /_matrix/maubot/v1/client/{mxid}
+#    PUT    /_matrix/maubot/v1/client/{mxid}   (anlegen oder ersetzen)
+#    DELETE /_matrix/maubot/v1/client/{mxid}
+#  Auth: Authorization: Bearer <token>
+# =============================================================================
+
+# read_maubot_config: laedt MAUBOT_URL + MAUBOT_TOKEN aus maubot.env, falls
+# vorhanden und noch nicht gesetzt. Sicheres Parsing (kein source).
+read_maubot_config() {
+  [[ -f "$MAUBOT_CONFIG_FILE" ]] || return 0
+  local line key value
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^([A-Z_]+)=\"(.*)\"$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      value="${BASH_REMATCH[2]}"
+      case "$key" in
+        MAUBOT_URL)   [[ -z "$MAUBOT_URL"   ]] && MAUBOT_URL="$value" ;;
+        MAUBOT_TOKEN) [[ -z "$MAUBOT_TOKEN" ]] && MAUBOT_TOKEN="$value" ;;
+      esac
+    fi
+  done < "$MAUBOT_CONFIG_FILE"
+}
+
+# write_maubot_config: speichert MAUBOT_URL + MAUBOT_TOKEN. Wird nur aufgerufen,
+# wenn der User explizit speichern moechte (oder beim Bootstrap-Login).
+write_maubot_config() {
+  [[ "$MAUBOT_NO_SAVE" == "true" ]] && { log_info "maubot-Config NICHT gespeichert (--maubot-no-save)."; return 0; }
+  mkdir -p "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR"
+  if [[ -f "$MAUBOT_CONFIG_FILE" ]]; then
+    local backup="${MAUBOT_CONFIG_FILE}.bak.$(date +%Y%m%d-%H%M%S)"
+    cp -- "$MAUBOT_CONFIG_FILE" "$backup"
+    chmod 600 "$backup"
+  fi
+  cat > "$MAUBOT_CONFIG_FILE" <<EOF
+# maubot-Verbindungsdaten fuer ${SCRIPT_NAME}
+# Generiert am $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# WARNUNG: Enthaelt einen Management-Token. NIEMALS in Git committen.
+
+MAUBOT_URL="${MAUBOT_URL}"
+MAUBOT_TOKEN="${MAUBOT_TOKEN}"
+EOF
+  chmod 600 "$MAUBOT_CONFIG_FILE"
+  log_ok "maubot-Config gespeichert: ${MAUBOT_CONFIG_FILE}"
+}
+
+# maubot_api METHOD PATH [-d=BODY]: Wrapper um http_request, der die
+# Base-URL + Auth-Header vorsetzt. Liefert "STATUS\nBODY" wie http_request.
+maubot_api() {
+  local method="$1"; shift
+  local path="$1"; shift
+  local url="${MAUBOT_URL%/}/_matrix/maubot/v1${path}"
+  if [[ "${1:-}" == "-d="* ]]; then
+    local body="$1"
+    http_request "$method" "$url" "$body" \
+      "Authorization: Bearer ${MAUBOT_TOKEN}"
+  else
+    http_request "$method" "$url" \
+      "Authorization: Bearer ${MAUBOT_TOKEN}"
+  fi
+}
+
+# maubot_login: holt einen Token per Username+Passwort. Setzt MAUBOT_TOKEN.
+maubot_login() {
+  local user="$1"
+  local pass="$2"
+  local body response status resp_body
+  body=$(jq -n --arg u "$user" --arg p "$pass" '{username:$u, password:$p}')
+  response=$(http_request POST "${MAUBOT_URL%/}/_matrix/maubot/v1/auth/login" "-d=$body")
+  status=$(echo "$response" | head -n1)
+  resp_body=$(echo "$response" | tail -n +2)
+  if [[ "$status" != "200" ]]; then
+    log_error "maubot-Login fehlgeschlagen (HTTP $status)."
+    echo "  Antwort: $resp_body" >&2
+    fatal "Pruefe Username/Passwort und ob das wirklich der maubot-Endpoint ist."
+  fi
+  MAUBOT_TOKEN=$(json_get "$resp_body" '.token')
+  [[ -z "$MAUBOT_TOKEN" ]] && fatal "Konnte token aus der Antwort nicht lesen."
+  log_ok "maubot-Login erfolgreich."
+}
+
+# maubot_ping: validiert den aktuellen Token. Gibt 0 zurueck wenn OK, 1 sonst.
+maubot_ping() {
+  local response status
+  response=$(maubot_api POST "/auth/ping")
+  status=$(echo "$response" | head -n1)
+  [[ "$status" == "200" ]]
+}
+
+# maubot_get_client <mxid>: pruefte ob ein Client existiert.
+# Echo: "200" wenn existiert, "404" wenn nicht, sonst Statuscode.
+maubot_get_client() {
+  local mxid="$1"
+  local encoded response status
+  encoded=$(url_encode_one "$mxid")
+  response=$(maubot_api GET "/client/${encoded}")
+  status=$(echo "$response" | head -n1)
+  echo "$status"
+}
+
+# maubot_put_client: legt den Bot als Client in maubot an oder ersetzt ihn.
+# Nutzt die globalen Bot-Werte (BOT_USER_ID, HOMESERVER_URL, BOT_ACCESS_TOKEN,
+# BOT_DEVICE_ID, BOT_DISPLAYNAME).
+maubot_put_client() {
+  local encoded url payload response status body
+  encoded=$(url_encode_one "$BOT_USER_ID")
+
+  # JSON-Body: alle Felder, die maubot fuer einen funktionalen Client braucht.
+  # sync/autojoin/enabled/online sind die typischen Bot-Defaults.
+  payload=$(jq -n \
+    --arg hs "$HOMESERVER_URL" \
+    --arg tok "$BOT_ACCESS_TOKEN" \
+    --arg dev "$BOT_DEVICE_ID" \
+    --arg dn "$BOT_DISPLAYNAME" \
+    '{ homeserver: $hs,
+       access_token: $tok,
+       device_id: $dev,
+       sync: true,
+       autojoin: true,
+       enabled: true,
+       online: true }
+     + (if $dn == "" then {} else { displayname: $dn } end)')
+
+  response=$(maubot_api PUT "/client/${encoded}" "-d=$payload")
+  status=$(echo "$response" | head -n1)
+  body=$(echo "$response" | tail -n +2)
+  case "$status" in
+    200|201)
+      log_ok "Client in maubot angelegt/aktualisiert (HTTP $status)."
+      return 0 ;;
+    *)
+      log_error "maubot-PUT fehlgeschlagen (HTTP $status)."
+      echo "  Antwort: $body" >&2
+      return 1 ;;
+  esac
+}
+
+# maubot_delete_client <mxid>: entfernt den Client aus maubot.
+maubot_delete_client() {
+  local mxid="$1"
+  local encoded response status body
+  encoded=$(url_encode_one "$mxid")
+  response=$(maubot_api DELETE "/client/${encoded}")
+  status=$(echo "$response" | head -n1)
+  body=$(echo "$response" | tail -n +2)
+  case "$status" in
+    200|204)
+      log_ok "Client aus maubot entfernt (HTTP $status)."
+      return 0 ;;
+    404)
+      log_warn "Client war in maubot nicht eingetragen (HTTP 404)."
+      return 0 ;;
+    *)
+      log_error "maubot-DELETE fehlgeschlagen (HTTP $status)."
+      echo "  Antwort: $body" >&2
+      return 1 ;;
+  esac
+}
+
+# ensure_maubot_url: stellt sicher, dass MAUBOT_URL gesetzt ist. Liest
+# erstmal die Config; wenn dort auch nichts steht, fragt interaktiv. In
+# non-interactive ohne Wert -> fatal.
+ensure_maubot_url() {
+  if [[ -z "$MAUBOT_URL" ]]; then
+    read_maubot_config
+  fi
+  if [[ -z "$MAUBOT_URL" ]]; then
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+      fatal "maubot-URL fehlt. --maubot-url angeben oder Config in $MAUBOT_CONFIG_FILE pflegen."
+    fi
+    while true; do
+      MAUBOT_URL=$(ask "maubot-URL (z.B. https://maubot.example.org)" "")
+      MAUBOT_URL="${MAUBOT_URL%/}"
+      [[ "$MAUBOT_URL" =~ ^https?://[a-zA-Z0-9.-]+(:[0-9]+)?$ ]] && break
+      log_warn "Das sieht nicht wie eine gueltige URL aus."
+    done
+  fi
+}
+
+# ensure_maubot_token: stellt sicher, dass MAUBOT_TOKEN gueltig ist. Reihenfolge:
+#   1. Wenn schon gesetzt -> ping zur Verifikation, ggf. invalidieren
+#   2. Aus maubot.env laden -> ping
+#   3. Interaktiv: vorhandenen Token eingeben ODER einmaliger Bootstrap-Login
+#      mit Username+Passwort (Passwort wird NICHT gespeichert, nur der Token).
+ensure_maubot_token() {
+  ensure_maubot_url
+
+  if [[ -n "$MAUBOT_TOKEN" ]]; then
+    if maubot_ping; then
+      log_ok "maubot-Token akzeptiert."
+      return 0
+    fi
+    log_warn "maubot-Token aus Flag/Config ist ungueltig oder abgelaufen."
+    MAUBOT_TOKEN=""
+  fi
+
+  read_maubot_config
+  if [[ -n "$MAUBOT_TOKEN" ]]; then
+    if maubot_ping; then
+      log_ok "maubot-Token aus Config akzeptiert."
+      return 0
+    fi
+    log_warn "Gespeicherter Token in $MAUBOT_CONFIG_FILE funktioniert nicht."
+    MAUBOT_TOKEN=""
+  fi
+
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    fatal "Kein gueltiger maubot-Token. --maubot-token angeben oder vorher interaktiv ausfuehren."
+  fi
+
+  explain \
+    "Wir brauchen einen maubot-Management-Token. Du hast zwei Optionen:" \
+    "  1) Du hast bereits einen Token zur Hand (z.B. aus dem Web-UI oder mbc-CLI)." \
+    "  2) Du loggst dich JETZT einmalig mit deinem maubot-Username+Passwort ein —" \
+    "     das Skript holt den Token fuer dich und speichert NUR den Token."
+  local choice
+  choice=$(ask "Auswahl (1/2)" "2")
+  if [[ "$choice" == "1" ]]; then
+    MAUBOT_TOKEN=$(ask_secret "maubot-Token (wird nicht angezeigt)")
+    [[ -z "$MAUBOT_TOKEN" ]] && fatal "Leerer Token."
+    maubot_ping || fatal "Token wird vom Server abgelehnt — falscher Token oder falsche URL?"
+    log_ok "Token verifiziert."
+  else
+    local user pass
+    user=$(ask "maubot-Username" "")
+    [[ -z "$user" ]] && fatal "Leerer Username."
+    pass=$(ask_secret "maubot-Passwort")
+    [[ -z "$pass" ]] && fatal "Leeres Passwort."
+    maubot_login "$user" "$pass"
+  fi
+
+  # Token speichern (sofern nicht --maubot-no-save).
+  if [[ "$MAUBOT_NO_SAVE" != "true" ]]; then
+    if ask_yes_no "maubot-URL und -Token persistent speichern (chmod 600)?" "y"; then
+      write_maubot_config
+    fi
+  fi
+}
+
+# register_in_maubot: trifft die Idempotenz-Entscheidung (GET -> 200/404),
+# fragt ggf. nach, und ruft dann maubot_put_client auf.
+register_in_maubot() {
+  ensure_maubot_token
+
+  local existing_status
+  existing_status=$(maubot_get_client "$BOT_USER_ID")
+  case "$existing_status" in
+    200)
+      log_warn "Client ${BOT_USER_ID} existiert in maubot bereits."
+      if [[ "$MAUBOT_REPLACE" == "true" ]]; then
+        log_info "Wird ueberschrieben (--maubot-replace)."
+      elif [[ "$NON_INTERACTIVE" == "true" ]]; then
+        fatal "In non-interactive Modus: --maubot-replace setzen, um zu ueberschreiben."
+      else
+        if ! ask_yes_no "Bestehenden maubot-Client ueberschreiben?" "n"; then
+          log_info "maubot-Eintragung uebersprungen."
+          return 0
+        fi
+      fi
+      ;;
+    404)
+      log_info "Client in maubot noch nicht vorhanden — wird neu angelegt."
+      ;;
+    *)
+      log_error "Unerwarteter Status beim maubot-GET: $existing_status"
+      fatal "Pruefe maubot-URL und Token."
+      ;;
+  esac
+
+  maubot_put_client || fatal "Konnte Client nicht in maubot eintragen."
+
+  printf '\n  %sNaechster Schritt in maubot:%s im Web-UI eine Plugin-Instanz auf\n' "$C_BOLD" "$C_RESET"
+  printf '  diesem Client anlegen (Clients -> %s -> + Instance).\n' "$BOT_USER_ID"
+}
+
+# =============================================================================
 #  Subcommand: register
 # =============================================================================
 
@@ -780,8 +1077,47 @@ step_12_rooms() {
   fi
 }
 
-step_13_summary() {
-  step_header 13 "Fertig — Zusammenfassung"
+step_13_maubot() {
+  step_header 13 "In maubot eintragen (optional)"
+  explain \
+    "maubot ist ein Plugin-Bot-Framework. Wenn du maubot betreibst, koennen wir" \
+    "den neuen Bot direkt als 'Client' dort eintragen — alle noetigen Werte" \
+    "(Homeserver, Access-Token, Device-ID, Displayname) haben wir gerade." \
+    "Plugin-Instanzen musst du anschliessend im maubot-Web-UI selbst anlegen."
+
+  if [[ "$SKIP_MAUBOT" == "true" ]]; then
+    log_info "maubot-Schritt uebersprungen (--no-maubot)."
+    return 0
+  fi
+
+  # Default-Antwort: wenn schon eine maubot-Config existiert ODER der User
+  # eine maubot-URL/Token mit Flags gegeben hat, ist die Wahrscheinlichkeit
+  # hoch, dass er ja meint. Sonst default n.
+  local default_answer="n"
+  if [[ -n "$MAUBOT_URL" || -n "$MAUBOT_TOKEN" || -f "$MAUBOT_CONFIG_FILE" ]]; then
+    default_answer="y"
+  fi
+
+  # In non-interactive: nur eintragen, wenn maubot-Daten explizit verfuegbar.
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    if [[ -n "$MAUBOT_URL" || -f "$MAUBOT_CONFIG_FILE" ]]; then
+      register_in_maubot
+    else
+      log_info "Keine maubot-Konfiguration sichtbar — Schritt uebersprungen."
+    fi
+    return 0
+  fi
+
+  if ask_yes_no "Bot jetzt in maubot eintragen?" "$default_answer"; then
+    register_in_maubot
+  else
+    log_info "OK, kein Eintrag in maubot. Spaeter mit:"
+    printf '  %s maubot-add %s\n' "$0" "$BOT_LOCALPART"
+  fi
+}
+
+step_14_summary() {
+  step_header 14 "Fertig — Zusammenfassung"
   printf '\n%sBot angelegt:%s\n' "$C_BOLD" "$C_RESET"
   printf '  Matrix-ID:       %s\n' "$BOT_USER_ID"
   printf '  Displayname:     %s\n' "${BOT_DISPLAYNAME:-(none)}"
@@ -801,6 +1137,8 @@ EOF
   printf '%sWeitere Befehle:%s\n' "$C_BOLD" "$C_RESET"
   printf '  %s invite %s <raum1> <raum2>     # Bot in weitere Raeume joinen\n' "$0" "$BOT_LOCALPART"
   printf '  %s rotate-token %s               # neuen Token holen\n' "$0" "$BOT_LOCALPART"
+  printf '  %s maubot-add %s                 # Bot in maubot eintragen\n' "$0" "$BOT_LOCALPART"
+  printf '  %s maubot-remove %s              # Bot aus maubot entfernen\n' "$0" "$BOT_LOCALPART"
   printf '  %s deactivate %s                 # Bot abschalten\n' "$0" "$BOT_LOCALPART"
   echo
   log_ok "Alles erledigt."
@@ -821,7 +1159,8 @@ cmd_register() {
   step_10_bot_login
   step_11_save_credentials
   step_12_rooms
-  step_13_summary
+  step_13_maubot
+  step_14_summary
 }
 
 # =============================================================================
@@ -945,6 +1284,53 @@ cmd_deactivate() {
 }
 
 # =============================================================================
+#  Subcommand: maubot-add
+# =============================================================================
+
+cmd_maubot_add() {
+  banner
+  require_tools
+  [[ -n "$BOT_LOCALPART" ]] || fatal "Bot-Localpart fehlt. Aufruf: maubot-add <bot>"
+
+  section_header "Bot in maubot eintragen"
+  explain \
+    "Wir laden die gespeicherte Bot-Config und tragen den Bot dann als Client" \
+    "in deine maubot-Instanz ein. Falls noch keine maubot-Verbindungsdaten" \
+    "konfiguriert sind, wirst du einmalig danach gefragt — danach werden" \
+    "URL und Token in ${MAUBOT_CONFIG_FILE} gespeichert."
+
+  read_config "$BOT_LOCALPART"
+  register_in_maubot
+}
+
+# =============================================================================
+#  Subcommand: maubot-remove
+# =============================================================================
+
+cmd_maubot_remove() {
+  banner
+  require_tools
+  [[ -n "$BOT_LOCALPART" ]] || fatal "Bot-Localpart fehlt. Aufruf: maubot-remove <bot>"
+
+  section_header "Bot aus maubot entfernen"
+  explain \
+    "Entfernt den Client aus der maubot-Instanz. Plugin-Instanzen, die diesen" \
+    "Client nutzen, werden in maubot vorher manuell geloescht werden muessen —" \
+    "sonst lehnt maubot das Loeschen ggf. ab."
+
+  read_config "$BOT_LOCALPART"
+  ensure_maubot_token
+
+  if [[ "$NON_INTERACTIVE" != "true" ]]; then
+    if ! ask_yes_no "Client ${BOT_USER_ID} wirklich aus maubot entfernen?" "n"; then
+      fatal "Abgebrochen."
+    fi
+  fi
+
+  maubot_delete_client "$BOT_USER_ID" || fatal "Loeschen fehlgeschlagen."
+}
+
+# =============================================================================
 #  CLI-Parsing
 # =============================================================================
 
@@ -958,6 +1344,8 @@ Verwendung:
   $0 invite <bot> <raum> [<raum>...]  # Bot in Raeume joinen (Admin force-join)
   $0 rotate-token <bot>               # Neuen Access-Token holen
   $0 deactivate <bot> [--erase]       # Bot deaktivieren
+  $0 maubot-add <bot>                 # Bot als Client in maubot eintragen
+  $0 maubot-remove <bot>              # Bot aus maubot entfernen
   $0 help                             # Diese Hilfe
 
 Gemeinsame Optionen:
@@ -974,20 +1362,33 @@ Optionen fuer 'register':
   --password PASS                Passwort vorgeben
   --generate-password            Zufaelliges Passwort erzeugen
   --rooms "r1,r2,..."            Raeume zum Auto-Join (kommasepariert)
+  --no-maubot                    maubot-Schritt im register-Flow auslassen
 
 Optionen fuer 'deactivate':
   --erase                        Profil-Daten zusaetzlich loeschen (irreversibel)
+
+maubot-Optionen (fuer register, maubot-add, maubot-remove):
+  --maubot-url URL               Maubot-URL (z.B. https://maubot.example.org)
+  --maubot-token TOKEN           Maubot-Management-Token (Bearer)
+  --maubot-replace               Bestehenden Client ohne Frage ueberschreiben
+  --maubot-no-save               Token NICHT in ${MAUBOT_CONFIG_FILE} speichern
+
+  Hinweis: Beim ersten Mal kannst du den Token interaktiv per einmaligem
+  Username/Passwort-Login holen. URL und Token werden danach in
+  ${MAUBOT_CONFIG_FILE} (chmod 600) abgelegt und automatisch wiederverwendet.
 
 Beispiele:
   # Interaktiv (empfohlen beim ersten Mal):
   $0
 
-  # Non-interaktiv komplett:
+  # Non-interaktiv komplett (inkl. maubot):
   $0 register --server https://matrix.example.org \\
               --admin-token \$ADMIN_TOKEN \\
               --bot wetterbot --displayname "Wetter Bot" \\
               --generate-password \\
               --rooms "#general:example.org,!abc123:example.org" \\
+              --maubot-url https://maubot.example.org \\
+              --maubot-token \$MAUBOT_TOKEN \\
               --non-interactive
 
   # Bot spaeter in einen Raum joinen:
@@ -995,6 +1396,12 @@ Beispiele:
 
   # Token erneuern (kein Admin-Token noetig — Bot-Passwort steht in der Config):
   $0 rotate-token wetterbot --server https://matrix.example.org
+
+  # Bestehenden Bot nachtraeglich in maubot eintragen:
+  $0 maubot-add wetterbot
+
+  # Bot aus maubot entfernen:
+  $0 maubot-remove wetterbot
 
   # Bot abschalten:
   $0 deactivate wetterbot --admin-token \$ADMIN_TOKEN
@@ -1038,6 +1445,13 @@ parse_flags() {
       --rooms)               IFS=',' read -r -a ROOMS <<<"$2"; shift 2 ;;
       --rooms=*)             IFS=',' read -r -a ROOMS <<<"${1#*=}"; shift ;;
       --erase)               ERASE_DATA="true"; shift ;;
+      --maubot-url)          MAUBOT_URL="${2%/}"; shift 2 ;;
+      --maubot-url=*)        MAUBOT_URL="${1#*=}"; MAUBOT_URL="${MAUBOT_URL%/}"; shift ;;
+      --maubot-token)        MAUBOT_TOKEN="$2"; shift 2 ;;
+      --maubot-token=*)      MAUBOT_TOKEN="${1#*=}"; shift ;;
+      --maubot-replace)      MAUBOT_REPLACE="true"; shift ;;
+      --maubot-no-save)      MAUBOT_NO_SAVE="true"; shift ;;
+      --no-maubot)           SKIP_MAUBOT="true"; shift ;;
       -h|--help)             usage; exit 0 ;;
       --)                    shift; while [[ $# -gt 0 ]]; do REMAINING_ARGS+=("$1"); shift; done ;;
       --*)                   fatal "Unbekanntes Flag: $1" ;;
@@ -1061,7 +1475,7 @@ parse_flags() {
         ROOMS+=("${REMAINING_ARGS[@]}")
       fi
       ;;
-    rotate-token|deactivate)
+    rotate-token|deactivate|maubot-add|maubot-remove)
       if [[ ${#REMAINING_ARGS[@]} -gt 0 && -z "$BOT_LOCALPART" ]]; then
         BOT_LOCALPART="${REMAINING_ARGS[0]}"
         REMAINING_ARGS=("${REMAINING_ARGS[@]:1}")
@@ -1085,7 +1499,7 @@ main() {
   local subcommand="register"
   if [[ $# -gt 0 ]]; then
     case "$1" in
-      register|invite|rotate-token|deactivate)
+      register|invite|rotate-token|deactivate|maubot-add|maubot-remove)
         subcommand="$1"; shift ;;
       help|--help|-h)
         usage; exit 0 ;;
@@ -1102,10 +1516,12 @@ main() {
   parse_flags "$subcommand" "$@"
 
   case "$subcommand" in
-    register)     cmd_register ;;
-    invite)       cmd_invite ;;
-    rotate-token) cmd_rotate_token ;;
-    deactivate)   cmd_deactivate ;;
+    register)      cmd_register ;;
+    invite)        cmd_invite ;;
+    rotate-token)  cmd_rotate_token ;;
+    deactivate)    cmd_deactivate ;;
+    maubot-add)    cmd_maubot_add ;;
+    maubot-remove) cmd_maubot_remove ;;
   esac
 }
 
