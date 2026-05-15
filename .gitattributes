@@ -1,0 +1,11 @@
+# Shell-Skripte MUESSEN LF behalten, sonst bricht /usr/bin/env bash auf Linux.
+*.sh text eol=lf
+
+# Generell LF fuer Text — wir entwickeln auf Windows, deployen auf Debian.
+* text=auto eol=lf
+
+# Binaerformate explizit markieren.
+*.png binary
+*.jpg binary
+*.ico binary
+*.gif binary

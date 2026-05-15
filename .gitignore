@@ -1,0 +1,27 @@
+# --- Geheimnisse / Credentials ---
+# Die vom Skript erzeugten .env-Dateien NIEMALS committen.
+*.env
+!examples/*.env
+secrets/
+*.token
+*.key
+
+# --- Backups vom Skript (Schritt 11) ---
+*.bak
+*.bak.*
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS-Klimmzueg ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Shellcheck / Build-Artefakte ---
+*.log
+.shellcheckrc.local
