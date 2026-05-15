@@ -39,8 +39,9 @@ from pydantic import BaseModel, Field
 
 from db import (
     add_bot, add_token, get_bot, get_token,
-    init_db, list_bots, list_tokens,
-    remove_bot, remove_token, update_bot,
+    init_db, list_bots, list_default_users, list_tokens,
+    remove_bot, remove_default_user, remove_token,
+    update_bot, upsert_default_user,
 )
 
 
@@ -579,6 +580,40 @@ async def api_wizard_setup_bot(payload: WizardSetup, request: Request):
     add_step("create_room", "ok", detail)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# /api/default-users — vorausgewaehlte Invite-Liste fuer Raum-Anlage / Wizard
+# ---------------------------------------------------------------------------
+
+class DefaultUserIn(BaseModel):
+    mxid: str
+    default_admin: bool = False
+
+
+def _validate_mxid(mxid: str) -> str:
+    mxid = mxid.strip()
+    if not mxid.startswith("@") or ":" not in mxid:
+        raise HTTPException(400, "MXID muss Format @localpart:server.tld haben")
+    return mxid
+
+
+@app.get("/api/default-users")
+async def api_list_default_users():
+    return {"users": await list_default_users()}
+
+
+@app.post("/api/default-users", status_code=201)
+async def api_upsert_default_user(payload: DefaultUserIn):
+    mxid = _validate_mxid(payload.mxid)
+    await upsert_default_user(mxid, payload.default_admin)
+    return {"mxid": mxid, "default_admin": payload.default_admin}
+
+
+@app.delete("/api/default-users/{mxid:path}")
+async def api_remove_default_user(mxid: str):
+    await remove_default_user(mxid)
+    return {"status": "deleted"}
 
 
 # ---------------------------------------------------------------------------

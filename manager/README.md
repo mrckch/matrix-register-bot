@@ -32,7 +32,8 @@ das laufende Drumherum (Token rotieren, Raeume anlegen, Bots loeschen).
 - Raeume eines Bots auflisten
 - Raum **als Bot** anlegen (Bot ist Creator + Power Level 100), optional
   verschluesselt/oeffentlich, mit voreingestellter Einladungs-Liste
-- Standard-Nutzer-Liste pflegen (im Browser-LocalStorage)
+- Standard-Nutzer-Liste pflegen (server-seitig in der Manager-DB, mit
+  Per-User-Default-Admin-Flag)
 
 ## Architektur
 
@@ -63,9 +64,8 @@ Browser ───► nginx-proxy-manager ───► matrix-bot-manager (FastAP
   - `SYNAPSE_ADMIN_TOKEN` — Access-Token eines Synapse-Admin-Users
   - `DB_PATH` (optional) — Default `/data/manager.db`
 - **Persistenz**: SQLite unter `DB_PATH`. Sollte als Volume eingehangen
-  sein, sonst sind Registry und Tokens beim naechsten `--build` weg.
-  Standard-Nutzer-Liste liegt weiterhin im Browser-LocalStorage (wird
-  spaeter ebenfalls server-seitig).
+  sein, sonst sind Registry, Tokens und Standard-Nutzer-Liste beim
+  naechsten `--build` weg.
 - **Sicherheit**: Der Admin-Token verlaesst den Container nie und landet
   weder im Browser noch im LocalStorage. Bot-Tokens werden ab v0.6 in
   SQLite gespeichert — wer Lesezugriff auf das Volume hat, sieht sie.

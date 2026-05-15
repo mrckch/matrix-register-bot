@@ -1,46 +1,62 @@
 import { useState } from "react";
 import { Icon } from "./Icon.jsx";
+import { apiPost, apiDelete } from "../api.js";
 import {
   labelStyle, inputStyle, btnPrimaryStyle, btnGhostStyle,
 } from "../styles.js";
 
-export function SettingsScreen({ config, onSave, onBack, addToast }) {
-  const [users, setUsers] = useState(config.defaultUsers || []);
+export function SettingsScreen({ config, onRefresh, onBack, addToast }) {
+  const users = config.defaultUsers || [];
   const [newMxid, setNewMxid] = useState("");
   const [newAdmin, setNewAdmin] = useState(true);
+  const [busy, setBusy] = useState(false);
 
-  function addUser() {
-    if (!newMxid.trim()) return;
+  async function addUser() {
     const mxid = newMxid.trim();
-    if (!mxid.startsWith("@")) {
-      addToast("Matrix-ID muss mit @ beginnen, z.B. @marc:server.de", "error");
-      return;
-    }
-    if (!mxid.includes(":")) {
-      addToast("Matrix-ID braucht einen Server-Teil, z.B. @marc:server.de", "error");
+    if (!mxid) return;
+    if (!mxid.startsWith("@") || !mxid.includes(":")) {
+      addToast("Matrix-ID muss Format @user:server haben", "error");
       return;
     }
     if (users.find(u => u.mxid === mxid)) {
       addToast("Dieser User ist schon in der Liste", "error");
       return;
     }
-    const next = [...users, { mxid, defaultAdmin: newAdmin }];
-    setUsers(next);
-    onSave({ ...config, defaultUsers: next });
-    setNewMxid("");
-    setNewAdmin(true);
+    setBusy(true);
+    try {
+      await apiPost("/default-users", { mxid, default_admin: newAdmin });
+      await onRefresh();
+      setNewMxid("");
+      setNewAdmin(true);
+    } catch (e) {
+      addToast("Fehler: " + e.message, "error");
+    } finally {
+      setBusy(false);
+    }
   }
 
-  function removeUser(mxid) {
-    const next = users.filter(u => u.mxid !== mxid);
-    setUsers(next);
-    onSave({ ...config, defaultUsers: next });
+  async function removeUser(mxid) {
+    setBusy(true);
+    try {
+      await apiDelete(`/default-users/${encodeURIComponent(mxid)}`);
+      await onRefresh();
+    } catch (e) {
+      addToast("Fehler: " + e.message, "error");
+    } finally {
+      setBusy(false);
+    }
   }
 
-  function toggleAdmin(mxid) {
-    const next = users.map(u => u.mxid === mxid ? { ...u, defaultAdmin: !u.defaultAdmin } : u);
-    setUsers(next);
-    onSave({ ...config, defaultUsers: next });
+  async function toggleAdmin(u) {
+    setBusy(true);
+    try {
+      await apiPost("/default-users", { mxid: u.mxid, default_admin: !u.default_admin });
+      await onRefresh();
+    } catch (e) {
+      addToast("Fehler: " + e.message, "error");
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
@@ -56,11 +72,11 @@ export function SettingsScreen({ config, onSave, onBack, addToast }) {
         </div>
         <h1 style={{ fontFamily: "'Syne', sans-serif", fontSize: 26, fontWeight: 800, margin: 0, color: "var(--text)" }}>Einladungs-Liste</h1>
         <p style={{ color: "var(--muted)", fontSize: 13, marginTop: 8, fontFamily: "'Space Mono', monospace", lineHeight: 1.6 }}>
-          Diese Nutzer werden beim Anlegen neuer Räume vorausgewählt. Pro Nutzer kann ein Standard-Admin-Status hinterlegt werden.
+          Diese Nutzer werden beim Anlegen neuer Räume (Setup-Wizard und CreateRoom-Tab) vorausgewählt.
+          Pro Nutzer kann ein Standard-Admin-Status hinterlegt werden. Speicherung server-seitig in der Manager-DB.
         </p>
       </div>
 
-      {/* Add user */}
       <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 12, padding: 20, marginBottom: 20 }}>
         <label style={labelStyle}>Neuer Standard-Nutzer</label>
         <div style={{ display: "flex", gap: 10, alignItems: "stretch" }}>
@@ -83,13 +99,12 @@ export function SettingsScreen({ config, onSave, onBack, addToast }) {
           >
             <Icon name="shield" size={13} /> Admin
           </button>
-          <button onClick={addUser} disabled={!newMxid} style={btnPrimaryStyle}>
+          <button onClick={addUser} disabled={!newMxid || busy} style={btnPrimaryStyle}>
             <Icon name="plus" size={14} /> Hinzufügen
           </button>
         </div>
       </div>
 
-      {/* List */}
       {users.length === 0 ? (
         <div style={{ textAlign: "center", padding: 48, color: "var(--muted)" }}>
           <div style={{ marginBottom: 12, opacity: 0.3 }}><Icon name="users" size={40} /></div>
@@ -114,18 +129,19 @@ export function SettingsScreen({ config, onSave, onBack, addToast }) {
                 {u.mxid}
               </span>
               <button
-                onClick={() => toggleAdmin(u.mxid)}
+                onClick={() => toggleAdmin(u)}
+                disabled={busy}
                 style={{
                   ...btnGhostStyle,
-                  background: u.defaultAdmin ? "var(--accent-dim)" : "transparent",
-                  color: u.defaultAdmin ? "var(--accent)" : "var(--muted)",
-                  borderColor: u.defaultAdmin ? "rgba(0,200,150,0.3)" : "var(--border)",
+                  background: u.default_admin ? "var(--accent-dim)" : "transparent",
+                  color: u.default_admin ? "var(--accent)" : "var(--muted)",
+                  borderColor: u.default_admin ? "rgba(0,200,150,0.3)" : "var(--border)",
                   padding: "6px 10px",
                 }}
               >
                 <Icon name="shield" size={12} /> Admin
               </button>
-              <button onClick={() => removeUser(u.mxid)} style={{ ...btnGhostStyle, padding: "6px 10px" }} title="Entfernen">
+              <button onClick={() => removeUser(u.mxid)} disabled={busy} style={{ ...btnGhostStyle, padding: "6px 10px" }} title="Entfernen">
                 <Icon name="trash" size={13} />
               </button>
             </div>

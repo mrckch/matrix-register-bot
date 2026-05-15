@@ -45,6 +45,12 @@ CREATE TABLE IF NOT EXISTS tokens (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tokens_mxid ON tokens(mxid);
+
+CREATE TABLE IF NOT EXISTS default_users (
+    mxid           TEXT PRIMARY KEY,
+    default_admin  INTEGER NOT NULL DEFAULT 0,
+    created_at     INTEGER NOT NULL
+);
 """
 
 
@@ -165,4 +171,34 @@ async def remove_token(mxid: str, token_id: int) -> None:
         await db.execute(
             "DELETE FROM tokens WHERE mxid = ? AND id = ?", (mxid, token_id),
         )
+        await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Default-User-Liste (vorausgewaehlte Invites in Raum-Anlage / Wizard)
+# ---------------------------------------------------------------------------
+
+async def list_default_users() -> list[dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT mxid, default_admin, created_at FROM default_users "
+            "ORDER BY created_at ASC"
+        )
+        return [{"mxid": r["mxid"], "default_admin": bool(r["default_admin"])} for r in rows]
+
+
+async def upsert_default_user(mxid: str, default_admin: bool) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO default_users (mxid, default_admin, created_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(mxid) DO UPDATE SET default_admin = excluded.default_admin",
+            (mxid, 1 if default_admin else 0, _now_ms()),
+        )
+        await db.commit()
+
+
+async def remove_default_user(mxid: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM default_users WHERE mxid = ?", (mxid,))
         await db.commit()

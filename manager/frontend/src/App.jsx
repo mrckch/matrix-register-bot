@@ -1,10 +1,11 @@
-import { useState, useEffect } from "react";
-import { health } from "./api.js";
-import { loadConfig, saveConfig } from "./storage.js";
+import { useState, useEffect, useCallback } from "react";
+import { health, apiGet, apiPost } from "./api.js";
 import { Toast, useToast } from "./components/Toast.jsx";
 import { SettingsScreen } from "./components/SettingsScreen.jsx";
 import { BotList } from "./components/BotList.jsx";
 import { BotDetail } from "./components/BotDetail.jsx";
+
+const LEGACY_LS_KEY = "matrix_bot_manager_config_v2";
 
 const GLOBAL_CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=Space+Mono:wght@400;700&family=IBM+Plex+Mono&display=swap');
@@ -30,26 +31,63 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 `;
 
+// One-time-Migration: alte LocalStorage-Liste ins Backend kippen, dann
+// LocalStorage leeren. Laeuft nur, wenn das Backend leer ist und die
+// LocalStorage einen alten Stand hat.
+async function migrateLegacyDefaultUsers(serverList) {
+  if (serverList.length > 0) return;
+  let legacy;
+  try {
+    legacy = JSON.parse(localStorage.getItem(LEGACY_LS_KEY) || "null");
+  } catch {
+    return;
+  }
+  const oldUsers = legacy?.defaultUsers;
+  if (!Array.isArray(oldUsers) || oldUsers.length === 0) return;
+
+  for (const u of oldUsers) {
+    if (!u.mxid) continue;
+    try {
+      await apiPost("/default-users", { mxid: u.mxid, default_admin: !!u.defaultAdmin });
+    } catch {
+      // Schlucken — wenn ein einzelner User nicht migrierbar ist, weitermachen.
+    }
+  }
+  localStorage.removeItem(LEGACY_LS_KEY);
+}
+
 export default function App() {
-  // config enthaelt: { serverName, defaultUsers }
-  // serverName kommt vom Backend (Env-Variable), nicht vom User.
   const [config, setConfig] = useState(null);
   const [bootError, setBootError] = useState(null);
   const [selectedBot, setSelectedBot] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const { toasts, addToast } = useToast();
 
-  // Beim Mount: Backend nach Server-Info fragen, defaultUsers aus localStorage laden.
+  const refreshDefaultUsers = useCallback(async () => {
+    const data = await apiGet("/default-users");
+    setConfig(prev => prev ? { ...prev, defaultUsers: data.users || [] } : prev);
+    return data.users || [];
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
         const info = await health();
         if (cancelled) return;
-        const local = loadConfig();
+        const data = await apiGet("/default-users");
+        if (cancelled) return;
+        let users = data.users || [];
+        await migrateLegacyDefaultUsers(users);
+        if (users.length === 0) {
+          // Nach Migration: nochmal lesen
+          const after = await apiGet("/default-users");
+          users = after.users || [];
+        }
+        if (cancelled) return;
         setConfig({
           serverName: info.server_name || "(unbekannt)",
-          defaultUsers: local.defaultUsers || [],
+          defaultUsers: users,
         });
       } catch (e) {
         if (cancelled) return;
@@ -58,12 +96,6 @@ export default function App() {
     })();
     return () => { cancelled = true; };
   }, []);
-
-  function handleSaveConfig(cfg) {
-    // Nur defaultUsers wird persistiert — alles andere kommt aus dem Backend.
-    saveConfig({ defaultUsers: cfg.defaultUsers || [] });
-    setConfig(cfg);
-  }
 
   let screen;
   if (bootError) {
@@ -86,7 +118,7 @@ export default function App() {
       </div>
     );
   } else if (showSettings) {
-    screen = <SettingsScreen config={config} onSave={handleSaveConfig} onBack={() => setShowSettings(false)} addToast={addToast} />;
+    screen = <SettingsScreen config={config} onRefresh={refreshDefaultUsers} onBack={() => setShowSettings(false)} addToast={addToast} />;
   } else if (selectedBot) {
     screen = <BotDetail bot={selectedBot} config={config} onBack={() => setSelectedBot(null)} addToast={addToast} />;
   } else {

@@ -15,7 +15,7 @@ export function CreateRoomTab({ bot, config, addToast, onRoomCreated }) {
 
   // selected: { mxid, admin, selected }
   const [selected, setSelected] = useState(
-    (config.defaultUsers || []).map(u => ({ mxid: u.mxid, admin: !!u.defaultAdmin, selected: true }))
+    (config.defaultUsers || []).map(u => ({ mxid: u.mxid, admin: !!(u.default_admin ?? u.defaultAdmin), selected: true }))
   );
 
   function toggleSelected(mxid) {

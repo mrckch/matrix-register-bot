@@ -37,7 +37,7 @@ export function SetupWizard({ config, onClose, onDone, addToast }) {
     encrypted: false,
     isPublic: false,
     invites: (config.defaultUsers || []).map(u => ({
-      mxid: u.mxid, admin: !!u.defaultAdmin, selected: true,
+      mxid: u.mxid, admin: !!(u.default_admin ?? u.defaultAdmin), selected: true,
     })),
   });
   const [extraMxid, setExtraMxid] = useState("");
