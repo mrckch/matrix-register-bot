@@ -24,7 +24,7 @@ abschalten willst.
 ### Auf deinem Rechner (Debian 13)
 
 ```bash
-sudo apt update && sudo apt install -y curl jq openssl
+apt update && apt install -y curl jq openssl
 ```
 
 ### Auf dem Synapse-Server: Ein Admin-User muss existieren
@@ -32,7 +32,7 @@ sudo apt update && sudo apt install -y curl jq openssl
 Synapse erzeugt keinen „Initial-Admin" für dich. Einmalig auf dem Synapse-Host:
 
 ```bash
-sudo register_new_matrix_user \
+register_new_matrix_user \
   -c /etc/matrix-synapse/homeserver.yaml \
   http://localhost:8008
 ```

@@ -29,7 +29,7 @@ IFS=$'\n\t'
 # =============================================================================
 
 readonly SCRIPT_NAME="matrix-register-bot"
-readonly SCRIPT_VERSION="0.4.1"
+readonly SCRIPT_VERSION="0.4.2"
 readonly CONFIG_DIR="${HOME}/.config/${SCRIPT_NAME}"
 
 # =============================================================================
@@ -406,7 +406,7 @@ require_tools() {
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
     log_error "Es fehlen folgende Werkzeuge: ${missing[*]}"
-    printf '\n    sudo apt update && sudo apt install -y %s\n\n' "${missing[*]}"
+    printf '\n    apt update && apt install -y %s\n\n' "${missing[*]}"
     fatal "Bitte zuerst die fehlenden Pakete installieren."
   fi
   ((BASH_VERSINFO[0] >= 4)) || fatal "Bash 4 oder neuer noetig."
