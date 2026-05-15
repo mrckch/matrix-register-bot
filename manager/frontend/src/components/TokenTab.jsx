@@ -224,7 +224,7 @@ function CreateTokenModal({ onCancel, onCreate }) {
             <label style={labelStyle}>Label (optional)</label>
             <input style={inputStyle} value={label}
               onChange={e => setLabel(e.target.value)}
-              placeholder="z.B. „prod" oder „maubot-instance"" autoFocus />
+              placeholder="z.B. 'prod' oder 'maubot-instance'" autoFocus />
             <div style={{ color: "var(--muted)", fontSize: 10, fontFamily: "'Space Mono', monospace", marginTop: 4 }}>
               Wird als Device-Anzeigename in Synapse gesetzt — auch in Ketesa/Element sichtbar.
             </div>
