@@ -29,7 +29,7 @@ IFS=$'\n\t'
 # =============================================================================
 
 readonly SCRIPT_NAME="matrix-register-bot"
-readonly SCRIPT_VERSION="0.4.0"
+readonly SCRIPT_VERSION="0.4.1"
 readonly CONFIG_DIR="${HOME}/.config/${SCRIPT_NAME}"
 
 # =============================================================================
@@ -161,6 +161,25 @@ fatal() {
   exit 1
 }
 
+# csv_split <input>: gibt jedes nicht-leere, gestripte Item zeilenweise aus.
+# Macht `--rooms ""` / `--dm "a,,b,"` robust: leere Eintraege werden verworfen.
+csv_split() {
+  local input="$1"
+  [[ -z "$input" ]] && return 0
+  local item trimmed
+  local oldIFS="$IFS"
+  IFS=','
+  # Globbing aus, damit ein '#raum:*' nicht versehentlich expandiert.
+  set -f
+  for item in $input; do
+    trimmed="${item#"${item%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    [[ -n "$trimmed" ]] && printf '%s\n' "$trimmed"
+  done
+  set +f
+  IFS="$oldIFS"
+}
+
 # =============================================================================
 #  HTTP-Helfer
 # =============================================================================
@@ -213,17 +232,32 @@ http_request() {
 json_get() {
   local json="$1"
   local path="$2"
-  echo "$json" | jq -r "${path} // empty" 2>/dev/null || echo ""
+  local out
+  # Kein "// empty" — sonst geht der Wert 'false' verloren (`false // empty` == empty).
+  # Stattdessen jq normal aufrufen und 'null' (= Feld nicht vorhanden) auf leer mappen.
+  if ! out=$(echo "$json" | jq -r "$path" 2>/dev/null); then
+    echo ""
+    return
+  fi
+  [[ "$out" == "null" ]] && out=""
+  echo "$out"
 }
 
 # url_encode_one: Encoded ein Path-Segment (User-ID oder Raum). Wir kodieren
 # die Zeichen, die in Matrix-IDs vorkommen und in URL-Pfaden Probleme machen.
+# WICHTIG: '%' MUSS zuerst kodiert werden, sonst werden bereits produzierte
+# %XX-Sequenzen ein zweites Mal kodiert.
 url_encode_one() {
   local s="$1"
+  s="${s//%/%25}"
   s="${s//@/%40}"
   s="${s//:/%3A}"
   s="${s//\!/%21}"
   s="${s//\#/%23}"
+  s="${s//\//%2F}"
+  s="${s//\?/%3F}"
+  s="${s//\&/%26}"
+  s="${s// /%20}"
   echo "$s"
 }
 
@@ -232,7 +266,48 @@ url_encode_one() {
 # =============================================================================
 
 config_path_for() {
-  echo "${CONFIG_DIR}/${1}.env"
+  # Der Matrix-Localpart darf '/' enthalten — das wuerde aber zu einem
+  # Unterverzeichnis im Pfad. Ersetzen wir durch '%2F' (URL-Stil), damit der
+  # Dateiname stabil bleibt und sich nicht mit echten Subdirs ueberlagert.
+  local safe="${1//\//%2F}"
+  echo "${CONFIG_DIR}/${safe}.env"
+}
+
+# shell_escape_for_dq: escaped einen Wert so, dass er innerhalb von "..." in
+# einer Shell-Datei korrekt liegt — d.h. `source` die Datei ohne Schaden lesen
+# kann. Reihenfolge wichtig: Backslash ZUERST, sonst werden nachfolgende
+# Escapes selbst nochmal eskapt.
+shell_escape_for_dq() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//\$/\\\$}"
+  s="${s//\`/\\\`}"
+  printf '%s' "$s"
+}
+
+# shell_unescape_from_dq: dreht shell_escape_for_dq um. Liest Zeichen fuer
+# Zeichen und konsumiert Backslash + Folgezeichen, wenn das Folgezeichen ein
+# bekanntes Escape ist. Andere Backslashes bleiben stehen.
+shell_unescape_from_dq() {
+  local s="$1"
+  local out="" i ch next
+  local len=${#s}
+  for (( i=0; i<len; i++ )); do
+    ch="${s:i:1}"
+    if [[ "$ch" == "\\" && $((i+1)) -lt len ]]; then
+      next="${s:i+1:1}"
+      case "$next" in
+        '\'|'"'|'$'|'`')
+          out+="$next"
+          (( i++ ))
+          continue
+          ;;
+      esac
+    fi
+    out+="$ch"
+  done
+  printf '%s' "$out"
 }
 
 # write_config: schreibt aktuellen State als .env. chmod 600.
@@ -251,18 +326,30 @@ write_config() {
     log_warn "Bestehende Datei nach ${backup} gesichert."
   fi
 
+  # Alle Werte fuer "..."-Kontext escapen, damit `source <datei>` auch dann
+  # noch funktioniert, wenn das Passwort oder der Displayname Quotes, $, ` etc.
+  # enthaelt.
+  local _hs _uid _local _dn _pw _tok _dev
+  _hs=$(shell_escape_for_dq    "$HOMESERVER_URL")
+  _uid=$(shell_escape_for_dq   "$BOT_USER_ID")
+  _local=$(shell_escape_for_dq "$BOT_LOCALPART")
+  _dn=$(shell_escape_for_dq    "$BOT_DISPLAYNAME")
+  _pw=$(shell_escape_for_dq    "$BOT_PASSWORD")
+  _tok=$(shell_escape_for_dq   "$BOT_ACCESS_TOKEN")
+  _dev=$(shell_escape_for_dq   "$BOT_DEVICE_ID")
+
   cat > "$target" <<EOF
 # matrix-register-bot — Credentials fuer ${BOT_USER_ID}
 # Generiert am $(date -u +%Y-%m-%dT%H:%M:%SZ) durch ${SCRIPT_NAME} ${SCRIPT_VERSION}
 # WARNUNG: Diese Datei enthaelt Geheimnisse. NIEMALS in Git committen.
 
-HOMESERVER_URL="${HOMESERVER_URL}"
-BOT_USER_ID="${BOT_USER_ID}"
-BOT_LOCALPART="${BOT_LOCALPART}"
-BOT_DISPLAYNAME="${BOT_DISPLAYNAME}"
-BOT_PASSWORD="${BOT_PASSWORD}"
-BOT_ACCESS_TOKEN="${BOT_ACCESS_TOKEN}"
-BOT_DEVICE_ID="${BOT_DEVICE_ID}"
+HOMESERVER_URL="${_hs}"
+BOT_USER_ID="${_uid}"
+BOT_LOCALPART="${_local}"
+BOT_DISPLAYNAME="${_dn}"
+BOT_PASSWORD="${_pw}"
+BOT_ACCESS_TOKEN="${_tok}"
+BOT_DEVICE_ID="${_dev}"
 EOF
   chmod 600 "$target"
   log_ok "Gespeichert: ${target}"
@@ -281,10 +368,16 @@ read_config() {
   while IFS= read -r line; do
     # Kommentare und Leerzeilen ueberspringen
     [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-    # Form: KEY="VALUE"
-    if [[ "$line" =~ ^([A-Z_]+)=\"(.*)\"$ ]]; then
+    # Form: KEY=VALUE — Schluessel ist alles vor dem ersten =. VALUE darf
+    # optional in "..." stehen; Inhalt wird in dem Fall unescaped (Pendant
+    # zu shell_escape_for_dq).
+    if [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]]; then
       key="${BASH_REMATCH[1]}"
       value="${BASH_REMATCH[2]}"
+      if [[ ${#value} -ge 2 && "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+        value=$(shell_unescape_from_dq "$value")
+      fi
       case "$key" in
         HOMESERVER_URL)    HOMESERVER_URL="$value" ;;
         BOT_USER_ID)       BOT_USER_ID="$value" ;;
@@ -328,7 +421,9 @@ prompt_homeserver_url() {
   while true; do
     HOMESERVER_URL=$(ask "Homeserver-URL (z.B. https://matrix.example.org)" "")
     HOMESERVER_URL="${HOMESERVER_URL%/}"
-    if [[ "$HOMESERVER_URL" =~ ^https?://[a-zA-Z0-9.-]+(:[0-9]+)?$ ]]; then
+    # http(s)://host[:port][/optional/subpath] — Subpath ist gaengig hinter
+    # Reverse-Proxies (z.B. https://example.org/matrix).
+    if [[ "$HOMESERVER_URL" =~ ^https?://[a-zA-Z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~%/!$&\'()*+,;=:@-]*)?$ ]]; then
       return 0
     fi
     log_warn "Das sieht nicht wie eine gueltige URL aus."
@@ -786,15 +881,32 @@ step_06_check_existing() {
       echo "  Aktueller Displayname: ${displayname:-(keiner)}"
       echo "  Deaktiviert:           ${deactivated:-false}"
 
-      # Im non-interactive Modus: Token rotieren (Passwort behalten),
-      # wenn ein Passwort bekannt ist, sonst fatal.
+      # Ein deaktivierter User wuerde durch das spaetere PUT (Step 9) mit
+      # 'deactivated: false' STILLSCHWEIGEND reaktiviert. Das ist fast nie
+      # gewollt, also explizit darauf hinweisen.
+      if [[ "$deactivated" == "true" ]]; then
+        log_warn "ACHTUNG: Dieser User ist deaktiviert. Beim Fortfahren wird er reaktiviert."
+      fi
+
+      # Im non-interactive Modus: Passwort + Token neu setzen, wenn entweder
+      # --password (BOT_PASSWORD != "") oder --generate-password
+      # (GENERATE_PASSWORD == "true") gegeben wurde. Sonst fatal — der User
+      # soll sich aktiv fuer eine der Optionen entscheiden.
       if [[ "$NON_INTERACTIVE" == "true" ]]; then
         if [[ -n "$BOT_PASSWORD" ]]; then
-          log_info "(non-interactive) Passwort wird neu gesetzt."
+          log_info "(non-interactive) Passwort wird neu gesetzt (aus --password)."
+        elif [[ "$GENERATE_PASSWORD" == "true" ]]; then
+          log_info "(non-interactive) Passwort wird neu gesetzt (--generate-password)."
         else
-          fatal "User existiert. In non-interactive --password angeben (oder rotate-token nutzen)."
+          fatal "User existiert. In non-interactive --password oder --generate-password angeben (oder rotate-token nutzen)."
         fi
         return 0
+      fi
+
+      if [[ "$deactivated" == "true" ]]; then
+        if ! ask_yes_no "Deaktivierten User ${BOT_USER_ID} jetzt reaktivieren?" "n"; then
+          fatal "Abgebrochen — User bleibt deaktiviert."
+        fi
       fi
 
       echo
@@ -945,7 +1057,7 @@ step_12_rooms() {
     local input
     input=$(ask "Raeume (leer = ueberspringen)" "")
     if [[ -n "$input" ]]; then
-      IFS=',' read -r -a ROOMS <<<"$input"
+      mapfile -t ROOMS < <(csv_split "$input")
     fi
   fi
 
@@ -984,7 +1096,7 @@ step_13_direct_messages() {
     local input
     input=$(ask "User-MXIDs (leer = ueberspringen)" "")
     if [[ -n "$input" ]]; then
-      IFS=',' read -r -a DMS <<<"$input"
+      mapfile -t DMS < <(csv_split "$input")
     fi
   fi
 
@@ -1315,11 +1427,11 @@ parse_flags() {
       --password)            BOT_PASSWORD="$2"; GENERATE_PASSWORD="false"; shift 2 ;;
       --password=*)          BOT_PASSWORD="${1#*=}"; GENERATE_PASSWORD="false"; shift ;;
       --generate-password)   GENERATE_PASSWORD="true"; shift ;;
-      --rooms)               IFS=',' read -r -a ROOMS <<<"$2"; shift 2 ;;
-      --rooms=*)             IFS=',' read -r -a ROOMS <<<"${1#*=}"; shift ;;
+      --rooms)               mapfile -t -O "${#ROOMS[@]}" ROOMS < <(csv_split "$2"); shift 2 ;;
+      --rooms=*)             mapfile -t -O "${#ROOMS[@]}" ROOMS < <(csv_split "${1#*=}"); shift ;;
       --erase)               ERASE_DATA="true"; shift ;;
-      --dm)                  IFS=',' read -r -a __tmp_dms <<<"$2"; DMS+=("${__tmp_dms[@]}"); unset __tmp_dms; shift 2 ;;
-      --dm=*)                IFS=',' read -r -a __tmp_dms <<<"${1#*=}"; DMS+=("${__tmp_dms[@]}"); unset __tmp_dms; shift ;;
+      --dm)                  mapfile -t -O "${#DMS[@]}" DMS < <(csv_split "$2"); shift 2 ;;
+      --dm=*)                mapfile -t -O "${#DMS[@]}" DMS < <(csv_split "${1#*=}"); shift ;;
       --dm-message)          DM_MESSAGE="$2"; shift 2 ;;
       --dm-message=*)        DM_MESSAGE="${1#*=}"; shift ;;
       --dm-no-message)       DM_NO_MESSAGE="true"; shift ;;
