@@ -18,6 +18,11 @@ services:
       SYNAPSE_URL: "http://matrix-synapse:8008"
       SYNAPSE_ADMIN_TOKEN: "${SYNAPSE_ADMIN_TOKEN}"
       # PORT: 8080
+      # DB_PATH: "/data/manager.db"
+    volumes:
+      # SQLite-Registry + Tokens. Ohne dieses Volume sind alle Eintraege
+      # nach jedem `docker compose up --build` weg.
+      - bot_manager_data:/data
     ports:
       # Optional — wenn du NPM/Reverse-Proxy auf einer anderen Box hast, dann
       # exposen. Sonst kann der Port auch nur intern bleiben.
@@ -26,6 +31,9 @@ services:
     # verwenden, damit "matrix-synapse" als Hostname aufloesbar ist.
     # networks:
     #   - matrix_default
+
+volumes:
+  bot_manager_data:
 
 # networks:
 #   matrix_default:

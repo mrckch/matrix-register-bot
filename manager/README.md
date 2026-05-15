@@ -12,7 +12,11 @@ das laufende Drumherum (Token rotieren, Raeume anlegen, Bots loeschen).
 
 ## Was die UI kann
 
-- Bots auflisten (alle User mit `user_type=bot`)
+- **Manager-eigene Bot-Registry** (SQLite) — unabhaengig vom Synapse-internen
+  `user_type=bot`-Flag, das auch versehentlich auf Nicht-Bots landen kann
+- Bots auflisten (nur aus der Registry)
+- Bestehende Synapse-Bots importieren (Modal mit allen `user_type=bot`-Usern,
+  einzeln in die Registry uebernehmen)
 - Neuen Bot anlegen (Localpart + Anzeigename, zufaelliges Passwort)
 - Bot-Detail: Anzeigename inline editieren
 - Access-Token fuer einen Bot generieren (Synapse Admin-Login-as-User)
@@ -26,24 +30,36 @@ das laufende Drumherum (Token rotieren, Raeume anlegen, Bots loeschen).
 ```
 Browser ───► nginx-proxy-manager ───► matrix-bot-manager (FastAPI)
                                              │
-                                  /api/synapse/* + Admin-Token
-                                  /api/client/*  + Bot-Token
+                                  /api/bots/*        — Registry-CRUD (SQLite + Synapse)
+                                  /api/discovery/*   — Lookup gegen Synapse fuer Import
+                                  /api/synapse/*     + Admin-Token  (Legacy-Proxy)
+                                  /api/client/*      + Bot-Token    (createRoom)
+                                             │
                                              ▼
                                        matrix-synapse:8008
+                                             │
+                       SQLite /data/manager.db (Registry + Tokens)
 ```
 
 - **Frontend**: React + Vite, statisch gebaut, vom Backend ausgeliefert
-- **Backend**: FastAPI + httpx, zwei Proxy-Routen:
-  - `/api/synapse/*` haengt den Admin-Token aus der Env an die Anfrage an und
-    leitet sie nach `{SYNAPSE_URL}/_synapse/admin/*` weiter
-  - `/api/client/*` reicht den `Authorization`-Header aus dem Request 1:1
-    weiter nach `{SYNAPSE_URL}/_matrix/client/v3/*` — wird fuer den
-    `createRoom`-Call mit dem **Bot-Token** genutzt
-- **Konfiguration**: zwei Env-Variablen (`SYNAPSE_URL`,
-  `SYNAPSE_ADMIN_TOKEN`). Der Admin-Token verlaesst den Container nie und
-  landet weder im Browser noch im Browser-LocalStorage.
-- **Persistenz**: keine. Standard-Nutzer-Liste liegt im LocalStorage des
-  Browsers (pro Geraet/Browser).
+- **Backend**: FastAPI + httpx + aiosqlite. Drei Endpoint-Familien:
+  - `/api/bots/*` — Manager-eigene Bot-Registry mit Live-Daten aus Synapse
+    angereichert (CRUD, Raeume, spaeter Token-Verwaltung)
+  - `/api/discovery/*` — Lookup gegen Synapse (z.B. Liste aller User mit
+    `user_type=bot`, die noch nicht in der Registry sind, fuer den Import)
+  - `/api/synapse/*` + `/api/client/*` — generische Proxies, behalten wir
+    fuer Calls, die noch nicht im Bot-API gekapselt sind (`createRoom`)
+- **Konfiguration**: drei Env-Variablen:
+  - `SYNAPSE_URL` — z.B. `http://matrix-synapse:8008`
+  - `SYNAPSE_ADMIN_TOKEN` — Access-Token eines Synapse-Admin-Users
+  - `DB_PATH` (optional) — Default `/data/manager.db`
+- **Persistenz**: SQLite unter `DB_PATH`. Sollte als Volume eingehangen
+  sein, sonst sind Registry und Tokens beim naechsten `--build` weg.
+  Standard-Nutzer-Liste liegt weiterhin im Browser-LocalStorage (wird
+  spaeter ebenfalls server-seitig).
+- **Sicherheit**: Der Admin-Token verlaesst den Container nie und landet
+  weder im Browser noch im LocalStorage. Bot-Tokens werden ab v0.6 in
+  SQLite gespeichert — wer Lesezugriff auf das Volume hat, sieht sie.
 
 ## Voraussetzungen
 
@@ -64,7 +80,18 @@ Browser ───► nginx-proxy-manager ───► matrix-bot-manager (FastAP
 ### 1. In den Compose-Stack einbauen
 
 Snippet aus [`docker-compose.yml.snippet`](docker-compose.yml.snippet) in dein
-bestehendes `docker-compose.yml` neben dem Synapse-Stack einfuegen.
+bestehendes `docker-compose.yml` neben dem Synapse-Stack einfuegen. **Achtung:**
+Ab v0.6 brauchst du zusaetzlich ein Volume fuer `/data` (SQLite-Persistenz),
+sonst sind Bot-Registry und Tokens nach jedem `--build` weg.
+
+```yaml
+volumes:
+  - bot_manager_data:/data
+# ... und ganz unten:
+volumes:
+  bot_manager_data:
+```
+
 Anschliessend `.env` neben deinem Compose-File anlegen:
 
 ```env
