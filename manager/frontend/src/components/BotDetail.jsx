@@ -1,38 +1,25 @@
 import { useState, useEffect } from "react";
 import { Icon } from "./Icon.jsx";
-import { apiGet, apiPut, synapsePost } from "../api.js";
+import { apiGet, apiPut } from "../api.js";
 import { CreateRoomTab } from "./CreateRoomTab.jsx";
+import { TokenTab } from "./TokenTab.jsx";
 import {
-  labelStyle, inputStyle, btnPrimaryStyle, btnGhostStyle, badgeStyle,
+  inputStyle, btnPrimaryStyle, btnGhostStyle, badgeStyle,
 } from "../styles.js";
 
 export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
   const [bot, setBot] = useState(initialBot);
-  const [token, setToken] = useState(null);
-  const [loadingToken, setLoadingToken] = useState(false);
-  const [copied, setCopied] = useState(false);
   const [rooms, setRooms] = useState(null);
   const [loadingRooms, setLoadingRooms] = useState(false);
   const [editing, setEditing] = useState(false);
   const [editDisplayname, setEditDisplayname] = useState(bot.displayname || "");
   const [saving, setSaving] = useState(false);
+  const [togglingActive, setTogglingActive] = useState(false);
   const [activeTab, setActiveTab] = useState("overview");
 
   const mxid = bot.mxid || bot.name;
   const localpart = bot.localpart || mxid.split(":")[0].replace("@", "");
   const initial = (bot.displayname || localpart)[0]?.toUpperCase() || "B";
-
-  async function fetchToken() {
-    setLoadingToken(true);
-    try {
-      const data = await synapsePost(`/v1/users/${encodeURIComponent(mxid)}/login`);
-      setToken(data.access_token);
-    } catch (e) {
-      addToast("Token-Fehler: " + e.message, "error");
-    } finally {
-      setLoadingToken(false);
-    }
-  }
 
   async function fetchRooms() {
     setLoadingRooms(true);
@@ -51,13 +38,6 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab]);
 
-  function copyToken() {
-    navigator.clipboard.writeText(token);
-    setCopied(true);
-    addToast("Token kopiert!", "success");
-    setTimeout(() => setCopied(false), 2000);
-  }
-
   async function saveDisplayname() {
     setSaving(true);
     try {
@@ -74,21 +54,49 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
     }
   }
 
+  async function toggleDeactivated() {
+    const wantDeactivate = !bot.deactivated;
+    const verb = wantDeactivate ? "deaktivieren" : "reaktivieren";
+    if (wantDeactivate) {
+      if (!confirm(
+        `Bot „${bot.displayname || localpart}" deaktivieren?\n\n` +
+        `Alle Räume werden verlassen, alle Tokens invalidiert. Der Synapse-User ` +
+        `bleibt erhalten, kann später reaktiviert werden (neues Passwort).`
+      )) return;
+    } else {
+      if (!confirm(
+        `Bot „${bot.displayname || localpart}" reaktivieren?\n\n` +
+        `Synapse vergibt einen neuen zufälligen Account-Status. Tokens müssen ` +
+        `neu erzeugt werden — alte sind weg.`
+      )) return;
+    }
+    setTogglingActive(true);
+    try {
+      const updated = await apiPut(`/bots/${encodeURIComponent(mxid)}`, {
+        deactivated: wantDeactivate,
+      });
+      setBot(updated);
+      addToast(`Bot ${wantDeactivate ? "deaktiviert" : "reaktiviert"}`, "success");
+    } catch (e) {
+      addToast(`Konnte nicht ${verb}: ` + e.message, "error");
+    } finally {
+      setTogglingActive(false);
+    }
+  }
+
   const tabs = [
     { id: "overview", label: "Übersicht", icon: "bot" },
-    { id: "token", label: "Token", icon: "key" },
+    { id: "token", label: "Tokens", icon: "key" },
     { id: "rooms", label: "Räume", icon: "rooms" },
     { id: "create-room", label: "Raum erstellen", icon: "plus" },
   ];
 
   return (
     <div style={{ padding: "32px", maxWidth: 800, margin: "0 auto" }}>
-      {/* Back */}
       <button onClick={onBack} style={{ ...btnGhostStyle, marginBottom: 24 }}>
         <Icon name="back" size={15} /> Alle Bots
       </button>
 
-      {/* Hero */}
       <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 16, padding: "28px 28px 0", marginBottom: 0 }}>
         <div style={{ display: "flex", alignItems: "flex-start", gap: 18, paddingBottom: 24, borderBottom: "1px solid var(--border)" }}>
           <div style={{
@@ -112,16 +120,34 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
               </div>
             )}
             <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: "var(--muted)", marginTop: 4 }}>{mxid}</div>
-            <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
+            <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap" }}>
               <span style={{ ...badgeStyle, background: bot.deactivated ? "rgba(255,77,77,0.15)" : "rgba(0,200,150,0.12)", color: bot.deactivated ? "#ff4d4d" : "var(--accent)", border: `1px solid ${bot.deactivated ? "rgba(255,77,77,0.3)" : "rgba(0,200,150,0.3)"}` }}>
                 {bot.deactivated ? "deaktiviert" : "aktiv"}
               </span>
               <span style={badgeStyle}>bot</span>
+              {!bot.exists_in_synapse && (
+                <span style={{ ...badgeStyle, color: "#ffa94d", border: "1px solid rgba(255,169,77,0.3)" }}>verwaist</span>
+              )}
             </div>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, alignSelf: "stretch" }}>
+            <button
+              onClick={toggleDeactivated}
+              disabled={togglingActive || !bot.exists_in_synapse}
+              style={{
+                ...btnGhostStyle,
+                color: bot.deactivated ? "var(--accent)" : "#ff4d4d",
+                borderColor: bot.deactivated ? "rgba(0,200,150,0.3)" : "rgba(255,77,77,0.3)",
+                fontSize: 12,
+              }}
+              title={bot.deactivated ? "Bot reaktivieren" : "Bot deaktivieren"}
+            >
+              <Icon name="power" size={13} />
+              {togglingActive ? "…" : (bot.deactivated ? "Reaktivieren" : "Deaktivieren")}
+            </button>
           </div>
         </div>
 
-        {/* Tabs */}
         <div style={{ display: "flex", gap: 0 }}>
           {tabs.map(t => (
             <button key={t.id} onClick={() => setActiveTab(t.id)} style={{
@@ -138,7 +164,6 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
         </div>
       </div>
 
-      {/* Tab content */}
       <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderTop: "none", borderRadius: "0 0 16px 16px", padding: 28 }}>
         {activeTab === "overview" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
@@ -147,6 +172,7 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
               ["Erstellt", bot.creation_ts ? new Date(bot.creation_ts).toLocaleString("de-DE") : "—"],
               ["Letzter Login", bot.last_seen_ts ? new Date(bot.last_seen_ts).toLocaleString("de-DE") : "—"],
               ["Admin", bot.admin ? "Ja" : "Nein"],
+              ["Synapse-Account", bot.exists_in_synapse ? (bot.deactivated ? "deaktiviert" : "aktiv") : "fehlt (verwaist)"],
             ].map(([k, v]) => (
               <div key={k} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 0", borderBottom: "1px solid var(--border)" }}>
                 <span style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 1 }}>{k}</span>
@@ -157,38 +183,7 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
         )}
 
         {activeTab === "token" && (
-          <div>
-            <p style={{ color: "var(--muted)", fontSize: 13, marginBottom: 20, fontFamily: "'Space Mono', monospace", lineHeight: 1.7 }}>
-              Generiert einen Access Token für diesen Bot, ohne dich als Bot einloggen zu müssen.
-            </p>
-            {!token ? (
-              <button onClick={fetchToken} disabled={loadingToken} style={{ ...btnPrimaryStyle, width: "100%", justifyContent: "center" }}>
-                <Icon name="key" size={15} /> {loadingToken ? "Generiere…" : "Access Token generieren"}
-              </button>
-            ) : (
-              <div>
-                <label style={labelStyle}>Access Token</label>
-                <div style={{ display: "flex", gap: 10, alignItems: "stretch" }}>
-                  <div style={{
-                    flex: 1, background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 8,
-                    padding: "12px 14px", fontFamily: "'Space Mono', monospace", fontSize: 11,
-                    color: "var(--accent)", wordBreak: "break-all", lineHeight: 1.6,
-                  }}>
-                    {token}
-                  </div>
-                  <button onClick={copyToken} style={{ ...btnPrimaryStyle, flexShrink: 0, alignSelf: "stretch" }} title="Kopieren">
-                    {copied ? <Icon name="check" size={15} /> : <Icon name="copy" size={15} />}
-                  </button>
-                </div>
-                <p style={{ color: "var(--muted)", fontSize: 11, marginTop: 10, fontFamily: "'Space Mono', monospace" }}>
-                  ⚠ Diesen Token sicher aufbewahren. Er wird nicht erneut angezeigt.
-                </p>
-                <button onClick={() => setToken(null)} style={{ ...btnGhostStyle, marginTop: 8, fontSize: 12 }}>
-                  Token verwerfen
-                </button>
-              </div>
-            )}
-          </div>
+          <TokenTab mxid={mxid} addToast={addToast} />
         )}
 
         {activeTab === "rooms" && (

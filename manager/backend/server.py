@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import secrets
 import string
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -37,9 +38,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from db import (
-    add_bot, get_bot,
-    init_db, list_bots,
-    remove_bot, update_bot,
+    add_bot, add_token, get_bot, get_token,
+    init_db, list_bots, list_tokens,
+    remove_bot, remove_token, update_bot,
 )
 
 
@@ -155,6 +156,17 @@ class BotImport(BaseModel):
 
 class BotUpdate(BaseModel):
     displayname: str | None = None
+    deactivated: bool | None = None
+
+
+class TokenCreate(BaseModel):
+    label: str | None = None
+    # Lebensdauer in Millisekunden. None = "nie" (~ 100 Jahre).
+    valid_for_ms: int | None = None
+
+
+# Default-Lebensdauer fuer "nie" — ~100 Jahre in Millisekunden.
+NEVER_EXPIRES_MS = 100 * 365 * 24 * 3600 * 1000
 
 
 async def _enrich_bot(http: httpx.AsyncClient, bot: dict[str, Any]) -> dict[str, Any]:
@@ -242,12 +254,26 @@ async def api_update_bot(mxid: str, payload: BotUpdate, request: Request):
     bot = await get_bot(mxid)
     if not bot:
         raise HTTPException(404, f"Bot {mxid} nicht in der Registry")
+
+    synapse_patch: dict[str, Any] = {}
     if payload.displayname is not None:
-        r = await _admin_put(http, f"/_synapse/admin/v2/users/{_q(mxid)}",
-                             {"displayname": payload.displayname})
+        synapse_patch["displayname"] = payload.displayname
+    if payload.deactivated is not None:
+        synapse_patch["deactivated"] = payload.deactivated
+
+    if synapse_patch:
+        r = await _admin_put(http, f"/_synapse/admin/v2/users/{_q(mxid)}", synapse_patch)
         if r.status_code not in (200, 201):
             raise HTTPException(r.status_code, f"Synapse: {r.text}")
-        await update_bot(mxid, displayname=payload.displayname)
+
+    db_patch: dict[str, Any] = {}
+    if payload.displayname is not None:
+        db_patch["displayname"] = payload.displayname
+    if payload.deactivated is not None:
+        db_patch["deactivated"] = 1 if payload.deactivated else 0
+    if db_patch:
+        await update_bot(mxid, **db_patch)
+
     return await _enrich_bot(http, await get_bot(mxid))
 
 
@@ -270,6 +296,119 @@ async def api_bot_rooms(mxid: str, request: Request):
     if r.status_code != 200:
         raise HTTPException(r.status_code, f"Synapse: {r.text}")
     return r.json()
+
+
+# ---------------------------------------------------------------------------
+# /api/bots/{mxid}/tokens — Token-Verwaltung
+# ---------------------------------------------------------------------------
+
+async def _fetch_devices(http: httpx.AsyncClient, mxid: str) -> dict[str, dict]:
+    """device_id -> device-Dict aus Synapse."""
+    r = await _admin_get(http, f"/_synapse/admin/v2/users/{_q(mxid)}/devices")
+    if r.status_code != 200:
+        return {}
+    return {d["device_id"]: d for d in r.json().get("devices", [])}
+
+
+@app.get("/api/bots/{mxid}/tokens")
+async def api_list_tokens(mxid: str, request: Request):
+    """Alle vom Manager fuer diesen Bot ausgestellten Tokens (Klartext).
+
+    Mit Synapse-Devices-Daten angereichert: last_seen_ts, last_seen_ip,
+    und ein Flag, ob das zugehoerige Device in Synapse noch existiert.
+    """
+    if not await get_bot(mxid):
+        raise HTTPException(404, f"Bot {mxid} nicht in der Registry")
+    tokens = await list_tokens(mxid)
+    devices = await _fetch_devices(request.app.state.http, mxid)
+    for t in tokens:
+        dev = devices.get(t["device_id"])
+        t["last_seen_ts"] = dev.get("last_seen_ts") if dev else None
+        t["last_seen_ip"] = dev.get("last_seen_ip") if dev else None
+        t["device_present"] = dev is not None
+    return {"tokens": tokens}
+
+
+@app.post("/api/bots/{mxid}/tokens", status_code=201)
+async def api_create_token(mxid: str, payload: TokenCreate, request: Request):
+    """Erzeugt einen neuen Access-Token via Synapse-Admin-Login-as-User und
+    speichert ihn Klartext in der SQLite-Registry.
+
+    Ohne valid_for_ms wird die maximale Lebensdauer (~100 Jahre) gesetzt —
+    der Synapse-Default waere sonst 1 Stunde.
+    """
+    http = request.app.state.http
+    if not await get_bot(mxid):
+        raise HTTPException(404, f"Bot {mxid} nicht in der Registry")
+
+    valid_for_ms = payload.valid_for_ms if payload.valid_for_ms else NEVER_EXPIRES_MS
+    valid_until_ms = int(time.time() * 1000) + valid_for_ms
+
+    r = await _admin_post(http, f"/_synapse/admin/v1/users/{_q(mxid)}/login",
+                          {"valid_until_ms": valid_until_ms})
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"Synapse: {r.text}")
+    access_token = r.json().get("access_token")
+    if not access_token:
+        raise HTTPException(502, "Synapse lieferte keinen access_token")
+
+    # device_id via /whoami ermitteln — der Admin-Login-Endpoint gibt sie selbst nicht zurueck.
+    w = await http.get(
+        f"{SYNAPSE_URL}/_matrix/client/v3/account/whoami",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    if w.status_code != 200:
+        raise HTTPException(502, "Konnte device_id nach Login nicht ermitteln")
+    device_id = w.json().get("device_id", "")
+
+    # Device-Display-Name auf das Label setzen, damit der Token in Element/Ketesa
+    # auch erkennbar ist (nicht nur im Manager).
+    if payload.label:
+        await http.put(
+            f"{SYNAPSE_URL}/_synapse/admin/v2/users/{_q(mxid)}/devices/{_q(device_id)}",
+            headers=ADMIN_HEADERS,
+            json={"display_name": payload.label},
+        )
+
+    token_id = await add_token(
+        mxid=mxid,
+        device_id=device_id,
+        access_token=access_token,
+        label=payload.label,
+        valid_until_ms=valid_until_ms,
+    )
+
+    return {
+        "id": token_id,
+        "mxid": mxid,
+        "device_id": device_id,
+        "access_token": access_token,
+        "label": payload.label,
+        "valid_until_ms": valid_until_ms,
+        "created_at": int(time.time() * 1000),
+    }
+
+
+@app.delete("/api/bots/{mxid}/tokens/{token_id}")
+async def api_delete_token(mxid: str, token_id: int, request: Request):
+    """Loescht das Synapse-Device (invalidiert den Token) und entfernt den
+    Eintrag aus der Registry. Wenn das Device in Synapse schon weg ist
+    (z.B. manuell ueber Ketesa geloescht), trotzdem aus der DB entfernen.
+    """
+    http = request.app.state.http
+    tok = await get_token(mxid, token_id)
+    if not tok:
+        raise HTTPException(404, "Token nicht gefunden")
+
+    r = await http.delete(
+        f"{SYNAPSE_URL}/_synapse/admin/v2/users/{_q(mxid)}/devices/{_q(tok['device_id'])}",
+        headers=ADMIN_HEADERS,
+    )
+    if r.status_code not in (200, 204, 404):
+        raise HTTPException(r.status_code, f"Synapse: {r.text}")
+
+    await remove_token(mxid, token_id)
+    return {"status": "deleted"}
 
 
 # ---------------------------------------------------------------------------

@@ -18,8 +18,13 @@ das laufende Drumherum (Token rotieren, Raeume anlegen, Bots loeschen).
 - Bestehende Synapse-Bots importieren (Modal mit allen `user_type=bot`-Usern,
   einzeln in die Registry uebernehmen)
 - Neuen Bot anlegen (Localpart + Anzeigename, zufaelliges Passwort)
-- Bot-Detail: Anzeigename inline editieren
-- Access-Token fuer einen Bot generieren (Synapse Admin-Login-as-User)
+- Bot-Detail: Anzeigename inline editieren, Bot **deaktivieren / reaktivieren**
+- **Token-Verwaltung** pro Bot:
+  - mehrere Tokens parallel mit individuellem Label und Gueltigkeitsdauer
+    (1h / 1d / 30d / 1y / 10y / "nie")
+  - Klartext-Anzeige (Reveal-Toggle), Copy-Button, einzeln loeschbar
+  - Label wird in Synapse als Device-Display-Name gesetzt
+  - Loeschen invalidiert das Synapse-Device sofort
 - Raeume eines Bots auflisten
 - Raum **als Bot** anlegen (Bot ist Creator + Power Level 100), optional
   verschluesselt/oeffentlich, mit voreingestellter Einladungs-Liste
