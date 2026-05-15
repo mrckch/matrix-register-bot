@@ -29,7 +29,7 @@ IFS=$'\n\t'
 # =============================================================================
 
 readonly SCRIPT_NAME="matrix-register-bot"
-readonly SCRIPT_VERSION="0.4.2"
+readonly SCRIPT_VERSION="0.4.3"
 readonly CONFIG_DIR="${HOME}/.config/${SCRIPT_NAME}"
 
 # =============================================================================
@@ -159,6 +159,44 @@ ask_yes_no() {
 fatal() {
   log_error "$*"
   exit 1
+}
+
+# extract_localpart <input> [expected_domain]
+# Liefert den Localpart einer Matrix-User-Eingabe auf stdout. Akzeptiert sowohl
+# nackten Localpart ("alice") als auch volle MXID ("@alice:matrix.example.org",
+# auch ohne fuehrendes "@"). Validiert den Localpart gegen die Matrix-Regel
+# (Kleinbuchstaben, Ziffern, . _ = / -).
+# Exit-Codes:
+#   0  OK
+#   1  Eingabe ist syntaktisch keine gueltige Matrix-User-Form
+#   2  MXID gegeben, Domain stimmt nicht mit expected_domain ueberein.
+#      Der Localpart wird trotzdem auf stdout ausgegeben (damit der Caller
+#      eine Mismatch-Meldung mit Werten formatieren kann).
+extract_localpart() {
+  local input="$1"
+  local expected_domain="${2:-}"
+  # Whitespace trimmen
+  input="${input#"${input%%[![:space:]]*}"}"
+  input="${input%"${input##*[![:space:]]}"}"
+  [[ -z "$input" ]] && return 1
+
+  local local_part="" domain=""
+  # Form mit Domain: optional "@", Localpart, ":", Domain
+  if [[ "$input" =~ ^@?([a-z0-9._=/-]+):([a-zA-Z0-9.-]+)$ ]]; then
+    local_part="${BASH_REMATCH[1]}"
+    domain="${BASH_REMATCH[2]}"
+  # Form ohne Domain: optional "@", Localpart
+  elif [[ "$input" =~ ^@?([a-z0-9._=/-]+)$ ]]; then
+    local_part="${BASH_REMATCH[1]}"
+  else
+    return 1
+  fi
+
+  printf '%s' "$local_part"
+  if [[ -n "$domain" && -n "$expected_domain" && "$domain" != "$expected_domain" ]]; then
+    return 2
+  fi
+  return 0
 }
 
 # csv_split <input>: gibt jedes nicht-leere, gestripte Item zeilenweise aus.
@@ -399,6 +437,23 @@ read_config() {
 #  Gemeinsame Bausteine (von mehreren Subcommands genutzt)
 # =============================================================================
 
+# normalize_bot_localpart_or_fatal: Wenn BOT_LOCALPART gesetzt ist (z.B. aus
+# Positionsarg oder --bot Flag) und der User die volle MXID angegeben hat,
+# wird auf den Localpart reduziert. Domain-Check passiert hier NICHT — bei den
+# Subcommands ausser register kennen wir die Server-Domain erst nach
+# read_config; ein Mismatch wuerde dort beim read_config auffallen.
+normalize_bot_localpart_or_fatal() {
+  [[ -z "$BOT_LOCALPART" ]] && return 0
+  local normalized
+  if ! normalized=$(extract_localpart "$BOT_LOCALPART"); then
+    fatal "Ungueltiger Bot-Localpart/MXID: '$BOT_LOCALPART'"
+  fi
+  if [[ "$normalized" != "$BOT_LOCALPART" ]]; then
+    log_info "Aus '${BOT_LOCALPART}' extrahiert: Localpart '${normalized}'"
+  fi
+  BOT_LOCALPART="$normalized"
+}
+
 require_tools() {
   local missing=()
   for tool in curl jq openssl; do
@@ -449,26 +504,55 @@ check_server_reachable() {
 obtain_admin_token() {
   if [[ -n "$ADMIN_TOKEN" ]]; then
     log_info "Admin-Token aus Flag/Env uebernommen."
-  elif [[ -n "$ADMIN_USER" && -n "$ADMIN_PASS" ]]; then
-    admin_login "$ADMIN_USER" "$ADMIN_PASS"
-  else
-    explain \
-      "Wir brauchen Admin-Rechte. Du kannst entweder einen vorhandenen Admin-" \
-      "Access-Token eingeben (Option 1) oder dich mit Admin-Benutzer+Passwort" \
-      "anmelden, sodass wir einen Token fuer dich holen (Option 2)."
-    local choice
-    choice=$(ask "Auswahl (1/2)" "2")
-    if [[ "$choice" == "1" ]]; then
-      ADMIN_TOKEN=$(ask_secret "Admin-Access-Token (wird nicht angezeigt)")
-      [[ -z "$ADMIN_TOKEN" ]] && fatal "Leerer Token."
-    else
-      ADMIN_USER=$(ask "Admin-Benutzername (Localpart)" "")
-      [[ -z "$ADMIN_USER" ]] && fatal "Leerer Benutzername."
-      ADMIN_PASS=$(ask_secret "Passwort des Admin-Users")
-      [[ -z "$ADMIN_PASS" ]] && fatal "Leeres Passwort."
-      admin_login "$ADMIN_USER" "$ADMIN_PASS"
-    fi
+    return 0
   fi
+
+  # ADMIN_USER kann aus --admin-user kommen — normalisieren und validieren.
+  if [[ -n "$ADMIN_USER" ]]; then
+    local normalized
+    if ! normalized=$(extract_localpart "$ADMIN_USER"); then
+      fatal "Ungueltiger Admin-Benutzername: '$ADMIN_USER' (erlaubt: a-z 0-9 . _ = / -, optional als MXID @user:domain)"
+    fi
+    if [[ "$normalized" != "$ADMIN_USER" ]]; then
+      log_info "Admin-Benutzername aus '$ADMIN_USER' auf Localpart '$normalized' reduziert."
+    fi
+    ADMIN_USER="$normalized"
+  fi
+
+  if [[ -n "$ADMIN_USER" && -n "$ADMIN_PASS" ]]; then
+    admin_login "$ADMIN_USER" "$ADMIN_PASS"
+    return 0
+  fi
+
+  explain \
+    "Wir brauchen Admin-Rechte. Du kannst entweder einen vorhandenen Admin-" \
+    "Access-Token eingeben (Option 1) oder dich mit Admin-Benutzer+Passwort" \
+    "anmelden, sodass wir einen Token fuer dich holen (Option 2)."
+  local choice
+  choice=$(ask "Auswahl (1/2)" "2")
+  if [[ "$choice" == "1" ]]; then
+    ADMIN_TOKEN=$(ask_secret "Admin-Access-Token (wird nicht angezeigt)")
+    [[ -z "$ADMIN_TOKEN" ]] && fatal "Leerer Token."
+    return 0
+  fi
+
+  # Option 2: User + Pass. Solange wiederholen, bis Eingabe valide.
+  if [[ -z "$ADMIN_USER" ]]; then
+    local raw normalized
+    while true; do
+      raw=$(ask "Admin-Benutzername (z.B. 'alice' oder '@alice:matrix.example.org')" "")
+      [[ -z "$raw" ]] && { log_warn "Leerer Benutzername. Nochmal."; continue; }
+      if normalized=$(extract_localpart "$raw"); then
+        ADMIN_USER="$normalized"
+        [[ "$normalized" != "$raw" ]] && log_info "Localpart extrahiert: '${ADMIN_USER}'"
+        break
+      fi
+      log_warn "Ungueltige Eingabe. Erlaubt: Localpart wie 'alice' oder MXID wie '@alice:domain'."
+    done
+  fi
+  ADMIN_PASS=$(ask_secret "Passwort des Admin-Users")
+  [[ -z "$ADMIN_PASS" ]] && fatal "Leeres Passwort."
+  admin_login "$ADMIN_USER" "$ADMIN_PASS"
 }
 
 admin_login() {
@@ -832,25 +916,52 @@ step_04_verify_admin() {
 }
 
 step_05_bot_localpart() {
-  step_header 5 "Bot-Benutzername (Localpart) waehlen"
+  step_header 5 "Bot-Benutzername (Localpart oder volle Matrix-ID)"
   explain \
-    "Der Localpart ist der Teil VOR dem Doppelpunkt in der Matrix-ID." \
-    "  Matrix-ID:  @wetterbot:${SERVER_DOMAIN}" \
-    "  Localpart:                wetterbot" \
-    "Erlaubt: Kleinbuchstaben, Ziffern, . _ = / -"
+    "Du kannst entweder nur den Localpart oder die volle Matrix-ID eingeben:" \
+    "  Localpart:    wetterbot" \
+    "  Matrix-ID:    @wetterbot:${SERVER_DOMAIN}" \
+    "Erlaubt im Localpart: Kleinbuchstaben, Ziffern, . _ = / -" \
+    "Bei voller MXID wird die Domain gegen den Server (${SERVER_DOMAIN}) geprueft."
 
   if [[ -n "$BOT_LOCALPART" ]]; then
-    if [[ ! "$BOT_LOCALPART" =~ ^[a-z0-9._=/-]+$ ]]; then
-      fatal "Ungueltiger Localpart aus Flag: '$BOT_LOCALPART'"
-    fi
-    log_info "Localpart: $BOT_LOCALPART"
+    local normalized rc=0
+    normalized=$(extract_localpart "$BOT_LOCALPART" "$SERVER_DOMAIN") || rc=$?
+    case $rc in
+      0)
+        if [[ "$normalized" != "$BOT_LOCALPART" ]]; then
+          log_info "Aus '${BOT_LOCALPART}' extrahiert: Localpart '${normalized}'"
+        fi
+        BOT_LOCALPART="$normalized"
+        ;;
+      2)
+        fatal "Bot-MXID '${BOT_LOCALPART}' gehoert nicht zu Server-Domain '${SERVER_DOMAIN}'."
+        ;;
+      *)
+        fatal "Ungueltiger Bot-Localpart aus Flag: '${BOT_LOCALPART}'"
+        ;;
+    esac
+    log_info "Localpart: ${BOT_LOCALPART}"
   else
+    local raw normalized rc
     while true; do
-      BOT_LOCALPART=$(ask "Localpart des Bots" "")
-      if [[ "$BOT_LOCALPART" =~ ^[a-z0-9._=/-]+$ ]]; then
-        break
-      fi
-      log_warn "Ungueltiger Localpart. Erlaubt: a-z 0-9 . _ = / -"
+      raw=$(ask "Bot-Localpart oder MXID (z.B. 'wetterbot' oder '@wetterbot:${SERVER_DOMAIN}')" "")
+      [[ -z "$raw" ]] && { log_warn "Leere Eingabe. Nochmal."; continue; }
+      rc=0
+      normalized=$(extract_localpart "$raw" "$SERVER_DOMAIN") || rc=$?
+      case $rc in
+        0)
+          BOT_LOCALPART="$normalized"
+          [[ "$normalized" != "$raw" ]] && log_info "Localpart extrahiert: '${BOT_LOCALPART}'"
+          break
+          ;;
+        2)
+          log_warn "Domain '${raw##*:}' passt nicht zu '${SERVER_DOMAIN}'. Bitte korrigieren."
+          ;;
+        *)
+          log_warn "Ungueltige Eingabe. Erlaubt: Localpart (a-z 0-9 . _ = / -) oder MXID (@local:domain)."
+          ;;
+      esac
     done
   fi
   BOT_USER_ID="@${BOT_LOCALPART}:${SERVER_DOMAIN}"
@@ -1182,6 +1293,7 @@ cmd_invite() {
   require_tools
 
   [[ -n "$BOT_LOCALPART" ]] || fatal "Bot-Localpart fehlt. Aufruf: invite <bot> <raum>..."
+  normalize_bot_localpart_or_fatal
   [[ ${#ROOMS[@]} -gt 0 ]]   || fatal "Mindestens einen Raum angeben. Aufruf: invite <bot> <raum>..."
 
   section_header "Bot in Raeume joinen (Admin force-join)"
@@ -1220,6 +1332,7 @@ cmd_dm() {
   banner
   require_tools
   [[ -n "$BOT_LOCALPART" ]] || fatal "Bot-Localpart fehlt. Aufruf: dm <bot> <user>..."
+  normalize_bot_localpart_or_fatal
   [[ ${#DMS[@]} -gt 0 ]]    || fatal "Mindestens einen User angeben. Aufruf: dm <bot> <user>..."
 
   section_header "Direkt-Chat mit User starten"
@@ -1254,6 +1367,7 @@ cmd_rotate_token() {
   banner
   require_tools
   [[ -n "$BOT_LOCALPART" ]] || fatal "Bot-Localpart fehlt. Aufruf: rotate-token <bot>"
+  normalize_bot_localpart_or_fatal
 
   section_header "Access-Token erneuern"
   explain \
@@ -1280,6 +1394,7 @@ cmd_deactivate() {
   banner
   require_tools
   [[ -n "$BOT_LOCALPART" ]] || fatal "Bot-Localpart fehlt. Aufruf: deactivate <bot>"
+  normalize_bot_localpart_or_fatal
 
   section_header "Bot deaktivieren"
   explain \
