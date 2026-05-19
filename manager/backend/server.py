@@ -453,7 +453,8 @@ async def api_set_bot_avatar(mxid: str, request: Request, file: UploadFile = Fil
 @app.get("/api/media-thumbnail")
 async def api_media_thumbnail(request: Request, mxc: str, size: int = 96):
     """Proxy fuer Synapse-Media-Thumbnails. Erlaubt es dem Browser, mxc://-URLs
-    direkt einzubetten. Authentifiziert mit dem Admin-Token.
+    direkt einzubetten. Probiert zuerst die authenticated-media-API (Synapse
+    v1.100+ Default) und faellt auf die alte unauthentifizierte zurueck.
     """
     if not mxc.startswith("mxc://"):
         raise HTTPException(400, "mxc-URL erwartet")
@@ -464,13 +465,31 @@ async def api_media_thumbnail(request: Request, mxc: str, size: int = 96):
     if size < 16: size = 16
     if size > 512: size = 512
 
-    r = await request.app.state.http.get(
-        f"{SYNAPSE_URL}/_matrix/media/v3/thumbnail/{_q(server)}/{_q(media_id)}",
+    http = request.app.state.http
+    params = {"width": size, "height": size, "method": "crop"}
+
+    # 1) Authenticated media (neu, ab Synapse v1.100, Matrix v1.11)
+    r = await http.get(
+        f"{SYNAPSE_URL}/_matrix/client/v1/media/thumbnail/{_q(server)}/{_q(media_id)}",
         headers={"Authorization": f"Bearer {SYNAPSE_ADMIN_TOKEN}"},
-        params={"width": size, "height": size, "method": "crop"},
+        params=params,
     )
+    # 2) Fallback: alte unauthentifizierte API (Synapse vor v1.100 / wenn
+    #    enable_authenticated_media abgeschaltet ist)
+    if r.status_code in (404, 405):
+        r = await http.get(
+            f"{SYNAPSE_URL}/_matrix/media/v3/thumbnail/{_q(server)}/{_q(media_id)}",
+            headers={"Authorization": f"Bearer {SYNAPSE_ADMIN_TOKEN}"},
+            params=params,
+        )
     if r.status_code != 200:
-        raise HTTPException(r.status_code, "Thumbnail nicht erreichbar")
+        # Detail-Body von Synapse mit durchreichen, damit der Browser-
+        # Konsolen-Logs/Network-Tab was Aussagekraeftiges zeigen.
+        body = r.text[:300] if r.text else ""
+        raise HTTPException(
+            r.status_code,
+            f"Synapse-Thumbnail {r.status_code}: {body or 'kein Body'}",
+        )
     return Response(
         content=r.content,
         status_code=200,

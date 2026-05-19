@@ -18,6 +18,10 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
   const [togglingActive, setTogglingActive] = useState(false);
   const [activeTab, setActiveTab] = useState("overview");
   const [showAvatarPicker, setShowAvatarPicker] = useState(false);
+  const [avatarFailed, setAvatarFailed] = useState(false);
+
+  // Wenn der Bot ein neues Avatar bekommt, Reset.
+  useEffect(() => { setAvatarFailed(false); }, [bot.avatar_url]);
 
   const mxid = bot.mxid || bot.name;
   const localpart = bot.localpart || mxid.split(":")[0].replace("@", "");
@@ -153,12 +157,12 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
               flexShrink: 0, cursor: bot.exists_in_synapse ? "pointer" : "default",
               overflow: "hidden", position: "relative",
             }}>
-            {bot.avatar_url ? (
+            {bot.avatar_url && !avatarFailed ? (
               <img
                 src={`/api/media-thumbnail?mxc=${encodeURIComponent(bot.avatar_url)}&size=112`}
                 alt=""
                 style={{ width: "100%", height: "100%", objectFit: "cover" }}
-                onError={e => { e.currentTarget.style.display = "none"; }}
+                onError={() => setAvatarFailed(true)}
               />
             ) : initial}
           </div>

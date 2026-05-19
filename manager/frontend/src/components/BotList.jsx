@@ -281,6 +281,8 @@ function BotCard({ bot, selected, onClick, onToggleSelect }) {
   const localpart = bot.localpart || bot.mxid.split(":")[0].replace("@", "");
   const initial = (bot.displayname || localpart)[0]?.toUpperCase() || "B";
   const deactivated = bot.deactivated || !bot.exists_in_synapse;
+  const [avatarFailed, setAvatarFailed] = useState(false);
+  useEffect(() => { setAvatarFailed(false); }, [bot.avatar_url]);
 
   return (
     <div onClick={onClick} style={{
@@ -316,12 +318,12 @@ function BotCard({ bot, selected, onClick, onToggleSelect }) {
           fontFamily: "'Syne', sans-serif", fontWeight: 800, fontSize: 18, color: "var(--accent)",
           flexShrink: 0, overflow: "hidden",
         }}>
-          {bot.avatar_url ? (
+          {bot.avatar_url && !avatarFailed ? (
             <img
               src={`/api/media-thumbnail?mxc=${encodeURIComponent(bot.avatar_url)}&size=80`}
               alt=""
               style={{ width: "100%", height: "100%", objectFit: "cover" }}
-              onError={e => { e.currentTarget.style.display = "none"; }}
+              onError={() => setAvatarFailed(true)}
             />
           ) : initial}
         </div>
