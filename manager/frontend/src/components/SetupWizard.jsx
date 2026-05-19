@@ -27,6 +27,7 @@ export function SetupWizard({ config, onClose, onDone, addToast }) {
   const [step, setStep] = useState(1);
   const [localpartTouched, setLocalpartTouched] = useState(false);
   const [roomNameTouched, setRoomNameTouched] = useState(false);
+  const [aliasTouched, setAliasTouched] = useState(false);
   const [data, setData] = useState({
     displayname: "",
     localpart: "",
@@ -34,6 +35,7 @@ export function SetupWizard({ config, onClose, onDone, addToast }) {
     tokenDurationIdx: DEFAULT_DURATION_IDX,
     roomName: "",
     roomTopic: "",
+    roomAlias: "",
     encrypted: false,
     isPublic: false,
     invites: (config.defaultUsers || []).map(u => ({
@@ -54,6 +56,16 @@ export function SetupWizard({ config, onClose, onDone, addToast }) {
       displayname: value,
       localpart: localpartTouched ? d.localpart : slugify(value),
       roomName: roomNameTouched ? d.roomName : value,
+      roomAlias: aliasTouched ? d.roomAlias : slugify(value),
+    }));
+  }
+
+  function onRoomNameChange(value) {
+    setRoomNameTouched(true);
+    setData(d => ({
+      ...d,
+      roomName: value,
+      roomAlias: aliasTouched ? d.roomAlias : slugify(value),
     }));
   }
 
@@ -95,6 +107,7 @@ export function SetupWizard({ config, onClose, onDone, addToast }) {
         topic: data.roomTopic || null,
         encrypted: data.encrypted,
         public: data.isPublic,
+        alias_localpart: data.roomAlias || null,
         invites: active.map(i => ({ mxid: i.mxid, power_level: i.admin ? 100 : 0 })),
       },
     };
@@ -130,7 +143,8 @@ export function SetupWizard({ config, onClose, onDone, addToast }) {
         {step === 2 && (
           <Step2
             data={data} setField={setField}
-            onRoomNameChange={v => { setRoomNameTouched(true); setField("roomName", v); }}
+            onRoomNameChange={onRoomNameChange}
+            onAliasChange={v => { setAliasTouched(true); setField("roomAlias", v); }}
           />
         )}
         {step === 3 && (
@@ -238,7 +252,7 @@ function Step1({ data, setField, onDisplaynameChange, onLocalpartChange }) {
   );
 }
 
-function Step2({ data, setField, onRoomNameChange }) {
+function Step2({ data, setField, onRoomNameChange, onAliasChange }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
       <div>
@@ -248,6 +262,15 @@ function Step2({ data, setField, onRoomNameChange }) {
           placeholder="z.B. Kurswahl" autoFocus />
         <div style={{ color: "var(--muted)", fontSize: 10, fontFamily: "'Space Mono', monospace", marginTop: 4 }}>
           Default = Bot-Anzeigename. Bot wird Creator (Power Level 100).
+        </div>
+      </div>
+      <div>
+        <label style={labelStyle}>Raum-Alias (optional)</label>
+        <input style={inputStyle} value={data.roomAlias}
+          onChange={e => onAliasChange(e.target.value.toLowerCase().replace(/\s/g, "-"))}
+          placeholder="kurswahl" />
+        <div style={{ color: "var(--muted)", fontSize: 10, fontFamily: "'Space Mono', monospace", marginTop: 4 }}>
+          Ergibt #{data.roomAlias || "raum-alias"}:server. Leer = nur Room-ID, kein Alias.
         </div>
       </div>
       <div>
@@ -358,6 +381,7 @@ function Step4({ data }) {
       <SummaryRow k="Token erzeugen" v={data.tokenLabel || "(ohne Label)"} sub={`Gültigkeit: ${duration}`} />
       <SummaryRow k="Raum anlegen" v={data.roomName}
         sub={[
+          data.roomAlias && `Alias: #${data.roomAlias}:[server]`,
           data.roomTopic && `Topic: ${data.roomTopic}`,
           data.encrypted ? "verschlüsselt" : "unverschlüsselt",
           data.isPublic ? "öffentlich" : "privat",
@@ -419,12 +443,19 @@ function Step5({ result, addToast }) {
       )}
 
       {result.room?.matrix_to && (
-        <a href={result.room.matrix_to} target="_blank" rel="noopener noreferrer" style={{
-          ...btnPrimaryStyle, width: "100%", justifyContent: "center",
-          textDecoration: "none",
-        }}>
-          <Icon name="rooms" size={14} /> Raum in Element öffnen
-        </a>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {result.room.room_alias && (
+            <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: "var(--muted)", lineHeight: 1.6 }}>
+              Raum-Alias: <span style={{ color: "var(--accent)" }}>{result.room.room_alias}</span>
+            </div>
+          )}
+          <a href={result.room.matrix_to} target="_blank" rel="noopener noreferrer" style={{
+            ...btnPrimaryStyle, width: "100%", justifyContent: "center",
+            textDecoration: "none",
+          }}>
+            <Icon name="rooms" size={14} /> Raum in Element öffnen
+          </a>
+        </div>
       )}
     </div>
   );

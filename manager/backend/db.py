@@ -15,6 +15,7 @@ naechsten `docker compose up --build` weg.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -51,6 +52,16 @@ CREATE TABLE IF NOT EXISTS default_users (
     default_admin  INTEGER NOT NULL DEFAULT 0,
     created_at     INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      INTEGER NOT NULL,
+    action  TEXT NOT NULL,
+    target  TEXT,
+    detail  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts DESC);
 """
 
 
@@ -202,3 +213,45 @@ async def remove_default_user(mxid: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM default_users WHERE mxid = ?", (mxid,))
         await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Audit-Log: Welche Aenderungen sind ueber den Manager passiert?
+# Detail-Feld wird als JSON-String abgelegt.
+# ---------------------------------------------------------------------------
+
+async def log_audit(action: str, target: str | None = None,
+                    detail: dict[str, Any] | None = None) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO audit_log (ts, action, target, detail) VALUES (?, ?, ?, ?)",
+            (_now_ms(), action, target, json.dumps(detail) if detail else None),
+        )
+        await db.commit()
+
+
+async def list_audit(limit: int = 200, offset: int = 0) -> list[dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT id, ts, action, target, detail FROM audit_log "
+            "ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        )
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            row = dict(r)
+            if row.get("detail"):
+                try:
+                    row["detail"] = json.loads(row["detail"])
+                except json.JSONDecodeError:
+                    pass
+            out.append(row)
+        return out
+
+
+async def count_audit() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM audit_log") as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0

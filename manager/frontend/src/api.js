@@ -50,6 +50,12 @@ export async function apiDelete(path) {
   return asJson(await fetch(`/api${path}`, { method: "DELETE" }));
 }
 
+export async function apiUpload(path, file, fieldName = "file") {
+  const fd = new FormData();
+  fd.append(fieldName, file);
+  return asJson(await fetch(`/api${path}`, { method: "POST", body: fd }));
+}
+
 // Legacy: direkter Admin-Proxy fuer Calls, die noch nicht ueber /api/bots laufen.
 export async function synapseGet(path) {
   return asJson(await fetch(`/api/synapse${path}`));

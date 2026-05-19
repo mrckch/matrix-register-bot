@@ -13,9 +13,18 @@ das laufende Drumherum (Token rotieren, Raeume anlegen, Bots loeschen).
 ## Was die UI kann
 
 - **Setup-Wizard „Bot + Raum komplett"** — Bot, Token (max. Dauer),
-  Raum (mit Topic/E2EE/öffentlich), Invites mit Per-User-Admin-Flag in
+  Raum (mit Topic/Alias/E2EE/öffentlich), Invites mit Per-User-Admin-Flag in
   einem Rutsch. Orchestriert vom Backend, gibt am Ende eine Statusliste
   pro Schritt zurück.
+- **Audit-Log** — jede schreibende Aktion (Bot-/Token-/Raum-Anlage,
+  Wizard-Setup, Standard-User-Pflege, Permanent-Löschung) landet in der
+  Manager-DB und ist im UI durchsuchbar (Activity-Icon im Header).
+- **Avatar pro Bot** — Klick auf den Avatar-Kreis im Bot-Detail öffnet
+  einen File-Picker, Bild wird ins Synapse-Media-Repo geladen und als
+  avatar_url gesetzt. Funktioniert auch in Element und Ketesa.
+- **Bot dauerhaft löschen** — Danger-Zone im Bot-Detail mit zwei Stufen:
+  „Aus Registry entfernen" (re-importierbar) oder „Permanent löschen"
+  (Synapse erase via Admin-API, hard confirm per Texteingabe).
 - **Manager-eigene Bot-Registry** (SQLite) — unabhaengig vom Synapse-internen
   `user_type=bot`-Flag, das auch versehentlich auf Nicht-Bots landen kann
 - Bots auflisten (nur aus der Registry)
@@ -69,6 +78,9 @@ Browser ───► nginx-proxy-manager ───► matrix-bot-manager (FastAP
 - **Sicherheit**: Der Admin-Token verlaesst den Container nie und landet
   weder im Browser noch im LocalStorage. Bot-Tokens werden ab v0.6 in
   SQLite gespeichert — wer Lesezugriff auf das Volume hat, sieht sie.
+- **Media-Thumbnails** werden ueber `/api/media-thumbnail?mxc=...` durch
+  den Container geproxyt — der Browser braucht keinen direkten Zugriff
+  auf das Synapse-Media-Endpoint.
 
 ## Voraussetzungen
 

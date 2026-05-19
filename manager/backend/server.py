@@ -32,15 +32,15 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from db import (
-    add_bot, add_token, get_bot, get_token,
-    init_db, list_bots, list_default_users, list_tokens,
-    remove_bot, remove_default_user, remove_token,
+    add_bot, add_token, count_audit, get_bot, get_token,
+    init_db, list_audit, list_bots, list_default_users, list_tokens,
+    log_audit, remove_bot, remove_default_user, remove_token,
     update_bot, upsert_default_user,
 )
 
@@ -180,6 +180,7 @@ async def _enrich_bot(http: httpx.AsyncClient, bot: dict[str, Any]) -> dict[str,
         bot["admin"] = bool(synapse.get("admin"))
         bot["creation_ts"] = synapse.get("creation_ts")
         bot["user_type"] = synapse.get("user_type")
+        bot["avatar_url"] = synapse.get("avatar_url")
         bot["exists_in_synapse"] = True
     else:
         bot["exists_in_synapse"] = False
@@ -216,6 +217,7 @@ async def api_create_bot(payload: BotCreate, request: Request):
         raise HTTPException(r.status_code, f"Synapse: {r.text}")
 
     await add_bot(mxid, localpart, payload.displayname or localpart)
+    await log_audit("create_bot", mxid, {"displayname": payload.displayname or localpart})
     bot = await get_bot(mxid)
     return await _enrich_bot(http, bot)
 
@@ -237,6 +239,7 @@ async def api_import_bot(payload: BotImport, request: Request):
         raise HTTPException(409, f"Bot {mxid} ist bereits in der Registry")
 
     await add_bot(mxid, _localpart_from_mxid(mxid), syn.get("displayname"))
+    await log_audit("import_bot", mxid, {"displayname": syn.get("displayname")})
     bot = await get_bot(mxid)
     return await _enrich_bot(http, bot)
 
@@ -275,16 +278,112 @@ async def api_update_bot(mxid: str, payload: BotUpdate, request: Request):
     if db_patch:
         await update_bot(mxid, **db_patch)
 
+    if payload.deactivated is True:
+        await log_audit("deactivate_bot", mxid)
+    elif payload.deactivated is False:
+        await log_audit("reactivate_bot", mxid)
+    if payload.displayname is not None:
+        await log_audit("rename_bot", mxid, {"displayname": payload.displayname})
+
     return await _enrich_bot(http, await get_bot(mxid))
 
 
 @app.delete("/api/bots/{mxid}")
-async def api_remove_bot(mxid: str):
-    """Entfernt den Bot NUR aus der Manager-Registry. Synapse-User bleibt."""
+async def api_remove_bot(mxid: str, request: Request, erase_synapse: bool = False):
+    """Entfernt den Bot aus der Manager-Registry. Mit ?erase_synapse=true wird
+    der Synapse-User zusaetzlich dauerhaft geloescht (Admin-API deactivate+erase).
+
+    Achtung: Synapse "erase" loescht Profilbild, Anzeigename und Konto-Daten,
+    aber nicht die historischen Nachrichten in Raeumen. Das ist designtechnisch
+    so vorgesehen (Foederation, Raumzustand).
+    """
     if not await get_bot(mxid):
         raise HTTPException(404, f"Bot {mxid} nicht in der Registry")
+
+    if erase_synapse:
+        r = await request.app.state.http.post(
+            f"{SYNAPSE_URL}/_synapse/admin/v1/deactivate/{_q(mxid)}",
+            headers=ADMIN_HEADERS,
+            json={"erase": True},
+        )
+        if r.status_code not in (200, 404):
+            raise HTTPException(r.status_code, f"Synapse-Erase fehlgeschlagen: {r.text}")
+        await log_audit("erase_bot", mxid)
+    else:
+        await log_audit("remove_bot_from_registry", mxid)
+
     await remove_bot(mxid)
-    return {"status": "removed-from-registry"}
+    return {"status": "erased" if erase_synapse else "removed-from-registry"}
+
+
+@app.post("/api/bots/{mxid}/avatar")
+async def api_set_bot_avatar(mxid: str, request: Request, file: UploadFile = File(...)):
+    """Laedt eine Bilddatei in das Synapse-Media-Repo und setzt sie als Avatar
+    fuer den Bot. Upload erfolgt mit dem Admin-Token (vereinfacht — kein
+    Bot-Token noetig). Synapse setzt avatar_url via Admin-v2-PUT.
+    """
+    if not await get_bot(mxid):
+        raise HTTPException(404, f"Bot {mxid} nicht in der Registry")
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(400, "Leere Datei")
+    if len(file_bytes) > 8 * 1024 * 1024:
+        raise HTTPException(413, "Datei zu groesser als 8 MB")
+
+    http = request.app.state.http
+    upload = await http.post(
+        f"{SYNAPSE_URL}/_matrix/media/v3/upload",
+        headers={
+            "Authorization": f"Bearer {SYNAPSE_ADMIN_TOKEN}",
+            "Content-Type": file.content_type or "application/octet-stream",
+        },
+        content=file_bytes,
+        params={"filename": file.filename or "avatar"},
+    )
+    if upload.status_code != 200:
+        raise HTTPException(upload.status_code, f"Media-Upload: {upload.text}")
+    mxc_url = upload.json().get("content_uri")
+    if not mxc_url:
+        raise HTTPException(502, "Synapse lieferte keine content_uri")
+
+    r = await _admin_put(http, f"/_synapse/admin/v2/users/{_q(mxid)}",
+                         {"avatar_url": mxc_url})
+    if r.status_code not in (200, 201):
+        raise HTTPException(r.status_code, f"Synapse: {r.text}")
+
+    await log_audit("set_avatar", mxid, {"avatar_url": mxc_url,
+                                          "size_bytes": len(file_bytes)})
+    return {"avatar_url": mxc_url}
+
+
+@app.get("/api/media-thumbnail")
+async def api_media_thumbnail(request: Request, mxc: str, size: int = 96):
+    """Proxy fuer Synapse-Media-Thumbnails. Erlaubt es dem Browser, mxc://-URLs
+    direkt einzubetten. Authentifiziert mit dem Admin-Token.
+    """
+    if not mxc.startswith("mxc://"):
+        raise HTTPException(400, "mxc-URL erwartet")
+    parts = mxc[6:].split("/", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise HTTPException(400, "mxc-URL ungueltig")
+    server, media_id = parts
+    if size < 16: size = 16
+    if size > 512: size = 512
+
+    r = await request.app.state.http.get(
+        f"{SYNAPSE_URL}/_matrix/media/v3/thumbnail/{_q(server)}/{_q(media_id)}",
+        headers={"Authorization": f"Bearer {SYNAPSE_ADMIN_TOKEN}"},
+        params={"width": size, "height": size, "method": "crop"},
+    )
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, "Thumbnail nicht erreichbar")
+    return Response(
+        content=r.content,
+        status_code=200,
+        media_type=r.headers.get("content-type", "image/jpeg"),
+        headers={"Cache-Control": "public, max-age=300"},
+    )
 
 
 @app.get("/api/bots/{mxid}/rooms")
@@ -379,6 +478,11 @@ async def api_create_token(mxid: str, payload: TokenCreate, request: Request):
         valid_until_ms=valid_until_ms,
     )
 
+    await log_audit("create_token", mxid, {
+        "device_id": device_id, "label": payload.label,
+        "valid_until_ms": valid_until_ms,
+    })
+
     return {
         "id": token_id,
         "mxid": mxid,
@@ -409,7 +513,105 @@ async def api_delete_token(mxid: str, token_id: int, request: Request):
         raise HTTPException(r.status_code, f"Synapse: {r.text}")
 
     await remove_token(mxid, token_id)
+    await log_audit("delete_token", mxid, {
+        "device_id": tok["device_id"], "label": tok.get("label"),
+    })
     return {"status": "deleted"}
+
+
+# ---------------------------------------------------------------------------
+# Helpers fuer Raum-Anlage als Bot — vom Wizard und /api/bots/{mxid}/rooms genutzt
+# ---------------------------------------------------------------------------
+
+async def _admin_login_as(http: httpx.AsyncClient, mxid: str,
+                          valid_for_ms: int = 3600 * 1000) -> str:
+    """Holt einen kurzlebigen Bot-Token via Synapse-Admin-Login-as-User."""
+    valid_until_ms = int(time.time() * 1000) + valid_for_ms
+    r = await _admin_post(http, f"/_synapse/admin/v1/users/{_q(mxid)}/login",
+                          {"valid_until_ms": valid_until_ms})
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"Admin-Login fehlgeschlagen: {r.text}")
+    token = r.json().get("access_token")
+    if not token:
+        raise HTTPException(502, "Synapse lieferte keinen access_token")
+    return token
+
+
+async def _create_room_as_bot(
+    http: httpx.AsyncClient, mxid: str, *,
+    name: str, topic: str | None, encrypted: bool, public: bool,
+    alias_localpart: str | None, invites: list[WizardInvite],
+    bot_token: str | None = None,
+) -> dict[str, Any]:
+    """Legt einen Raum mit Bot als Creator an (Power Level 100).
+    Invites und Power-Levels werden in einem createRoom-Call mitgegeben.
+    """
+    if bot_token is None:
+        bot_token = await _admin_login_as(http, mxid)
+
+    initial_state: list[dict] = []
+    if encrypted:
+        initial_state.append({
+            "type": "m.room.encryption",
+            "state_key": "",
+            "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+        })
+
+    user_pls: dict[str, int] = {mxid: 100}
+    for inv in invites:
+        if inv.power_level > 0:
+            user_pls[inv.mxid] = inv.power_level
+
+    body: dict[str, Any] = {
+        "name": name,
+        "invite": [inv.mxid for inv in invites],
+        "preset": "public_chat" if public else "private_chat",
+        "visibility": "public" if public else "private",
+        "initial_state": initial_state,
+        "power_level_content_override": {"users": user_pls},
+    }
+    if topic:
+        body["topic"] = topic
+    if alias_localpart:
+        body["room_alias_name"] = alias_localpart
+
+    r = await http.post(
+        f"{SYNAPSE_URL}/_matrix/client/v3/createRoom",
+        headers={"Authorization": f"Bearer {bot_token}",
+                 "Content-Type": "application/json"},
+        json=body,
+    )
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"createRoom: {r.text}")
+    data = r.json()
+    return {
+        "room_id": data.get("room_id"),
+        "room_alias": data.get("room_alias"),
+    }
+
+
+@app.post("/api/bots/{mxid}/rooms", status_code=201)
+async def api_create_room_for_bot(mxid: str, payload: RoomCreate, request: Request):
+    """Legt einen Raum mit dem Bot als Creator an. Genutzt vom CreateRoomTab
+    im BotDetail (Wizard nutzt _create_room_as_bot direkt im Step 3)."""
+    if not await get_bot(mxid):
+        raise HTTPException(404, f"Bot {mxid} nicht in der Registry")
+
+    result = await _create_room_as_bot(
+        request.app.state.http, mxid,
+        name=payload.name, topic=payload.topic,
+        encrypted=payload.encrypted, public=payload.public,
+        alias_localpart=payload.alias_localpart,
+        invites=payload.invites,
+    )
+    await log_audit("create_room", mxid, {
+        "room_id": result["room_id"],
+        "room_alias": result.get("room_alias"),
+        "name": payload.name,
+        "n_invites": len(payload.invites),
+    })
+    result["matrix_to"] = f"https://matrix.to/#/{result['room_id']}"
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +628,17 @@ class WizardRoom(BaseModel):
     topic: str | None = None
     encrypted: bool = False
     public: bool = False
+    # Optionaler Raum-Alias-Localpart: aus "kurswahl" wird "#kurswahl:server".
+    alias_localpart: str | None = None
+    invites: list[WizardInvite] = []
+
+
+class RoomCreate(BaseModel):
+    name: str
+    topic: str | None = None
+    encrypted: bool = False
+    public: bool = False
+    alias_localpart: str | None = None
     invites: list[WizardInvite] = []
 
 
@@ -532,54 +745,56 @@ async def api_wizard_setup_bot(payload: WizardSetup, request: Request):
     add_step("create_token", "ok", f"Device {device_id}")
 
     # ----- Step 3: Raum anlegen (mit Invites und Power-Levels in einem Rutsch) -----
-    initial_state: list[dict] = []
-    if payload.room.encrypted:
-        initial_state.append({
-            "type": "m.room.encryption",
-            "state_key": "",
-            "content": {"algorithm": "m.megolm.v1.aes-sha2"},
-        })
-
-    user_pls: dict[str, int] = {mxid: 100}  # Bot ist Creator
-    for inv in payload.room.invites:
-        if inv.power_level > 0:
-            user_pls[inv.mxid] = inv.power_level
-
-    body: dict[str, Any] = {
-        "name": payload.room.name,
-        "invite": [inv.mxid for inv in payload.room.invites],
-        "preset": "public_chat" if payload.room.public else "private_chat",
-        "visibility": "public" if payload.room.public else "private",
-        "initial_state": initial_state,
-        "power_level_content_override": {"users": user_pls},
-    }
-    if payload.room.topic:
-        body["topic"] = payload.room.topic
-
-    r = await http.post(
-        f"{SYNAPSE_URL}/_matrix/client/v3/createRoom",
-        headers={"Authorization": f"Bearer {access_token}",
-                 "Content-Type": "application/json"},
-        json=body,
-    )
-    if r.status_code != 200:
-        add_step("create_room", "error", f"Synapse: {r.text}")
+    try:
+        room = await _create_room_as_bot(
+            http, mxid,
+            name=payload.room.name, topic=payload.room.topic,
+            encrypted=payload.room.encrypted, public=payload.room.public,
+            alias_localpart=payload.room.alias_localpart,
+            invites=payload.room.invites,
+            bot_token=access_token,  # vorhin frisch geholt — wiederverwenden
+        )
+    except HTTPException as e:
+        add_step("create_room", "error", e.detail)
         return result
 
-    room_id = r.json().get("room_id")
     n_invites = len(payload.room.invites)
     n_admins = sum(1 for inv in payload.room.invites if inv.power_level >= 100)
-    detail = f"{room_id} ({n_invites} eingeladen"
+    detail = f"{room['room_id']} ({n_invites} eingeladen"
     if n_admins:
         detail += f", {n_admins} davon Admin"
+    if room.get("room_alias"):
+        detail += f", Alias {room['room_alias']}"
     detail += ")"
     result["room"] = {
-        "room_id": room_id,
-        "matrix_to": f"https://matrix.to/#/{room_id}",
+        "room_id": room["room_id"],
+        "room_alias": room.get("room_alias"),
+        "matrix_to": f"https://matrix.to/#/{room.get('room_alias') or room['room_id']}",
     }
     add_step("create_room", "ok", detail)
 
+    await log_audit("wizard_setup", mxid, {
+        "room_id": room["room_id"], "room_alias": room.get("room_alias"),
+        "room_name": payload.room.name,
+        "n_invites": n_invites, "n_admins": n_admins,
+        "encrypted": payload.room.encrypted, "public": payload.room.public,
+    })
+
     return result
+
+
+# ---------------------------------------------------------------------------
+# /api/audit — Audit-Log lesen
+# ---------------------------------------------------------------------------
+
+@app.get("/api/audit")
+async def api_audit(limit: int = 200, offset: int = 0):
+    if limit < 1: limit = 1
+    if limit > 1000: limit = 1000
+    if offset < 0: offset = 0
+    entries = await list_audit(limit=limit, offset=offset)
+    total = await count_audit()
+    return {"entries": entries, "total": total, "limit": limit, "offset": offset}
 
 
 # ---------------------------------------------------------------------------
@@ -607,12 +822,14 @@ async def api_list_default_users():
 async def api_upsert_default_user(payload: DefaultUserIn):
     mxid = _validate_mxid(payload.mxid)
     await upsert_default_user(mxid, payload.default_admin)
+    await log_audit("upsert_default_user", mxid, {"default_admin": payload.default_admin})
     return {"mxid": mxid, "default_admin": payload.default_admin}
 
 
 @app.delete("/api/default-users/{mxid:path}")
 async def api_remove_default_user(mxid: str):
     await remove_default_user(mxid)
+    await log_audit("remove_default_user", mxid)
     return {"status": "deleted"}
 
 

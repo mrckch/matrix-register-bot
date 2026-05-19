@@ -1,6 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Icon } from "./Icon.jsx";
-import { apiGet, apiPut } from "../api.js";
+import { apiGet, apiPut, apiDelete, apiUpload } from "../api.js";
 import { CreateRoomTab } from "./CreateRoomTab.jsx";
 import { TokenTab } from "./TokenTab.jsx";
 import {
@@ -16,6 +16,8 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
   const [saving, setSaving] = useState(false);
   const [togglingActive, setTogglingActive] = useState(false);
   const [activeTab, setActiveTab] = useState("overview");
+  const [uploadingAvatar, setUploadingAvatar] = useState(false);
+  const fileInputRef = useRef(null);
 
   const mxid = bot.mxid || bot.name;
   const localpart = bot.localpart || mxid.split(":")[0].replace("@", "");
@@ -84,6 +86,67 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
     }
   }
 
+  async function deleteFromRegistry() {
+    if (!confirm(
+      `Bot „${bot.displayname || localpart}" aus der Manager-Registry entfernen?\n\n` +
+      `Der Synapse-User bleibt bestehen — Tokens, Räume, Mitgliedschaften sind nicht betroffen. ` +
+      `Du kannst den Bot später per „Importieren" wieder reinholen.`
+    )) return;
+    try {
+      await apiDelete(`/bots/${encodeURIComponent(mxid)}`);
+      addToast("Aus Registry entfernt", "success");
+      onBack();
+    } catch (e) {
+      addToast("Fehler: " + e.message, "error");
+    }
+  }
+
+  async function handleAvatarUpload(e) {
+    const file = e.target.files?.[0];
+    e.target.value = "";  // damit dieselbe Datei nochmal geht
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      addToast("Bitte eine Bilddatei wählen", "error");
+      return;
+    }
+    if (file.size > 8 * 1024 * 1024) {
+      addToast("Datei zu groß (max 8 MB)", "error");
+      return;
+    }
+    setUploadingAvatar(true);
+    try {
+      const r = await apiUpload(`/bots/${encodeURIComponent(mxid)}/avatar`, file);
+      setBot(b => ({ ...b, avatar_url: r.avatar_url }));
+      addToast("Avatar gesetzt", "success");
+    } catch (err) {
+      addToast("Avatar-Fehler: " + err.message, "error");
+    } finally {
+      setUploadingAvatar(false);
+    }
+  }
+
+  async function eraseSynapse() {
+    const phrase = `lösche ${localpart}`;
+    const answer = prompt(
+      `Bot „${bot.displayname || localpart}" PERMANENT löschen?\n\n` +
+      `Synapse-User wird via Admin-API deaktiviert + erased: ` +
+      `Profilbild, Anzeigename, Konto-Daten weg. Tokens invalidiert. ` +
+      `Historische Nachrichten in Räumen bleiben aus Designgründen erhalten.\n\n` +
+      `Zum Bestätigen tippe: ${phrase}`
+    );
+    if (answer?.trim() !== phrase) {
+      if (answer !== null) addToast("Falsche Bestätigung, abgebrochen", "error");
+      return;
+    }
+    try {
+      await apiDelete(`/bots/${encodeURIComponent(mxid)}?erase_synapse=true`);
+      addToast("Bot permanent gelöscht", "success");
+      onBack();
+    } catch (e) {
+      addToast("Fehler: " + e.message, "error");
+    }
+  }
+
   const tabs = [
     { id: "overview", label: "Übersicht", icon: "bot" },
     { id: "token", label: "Tokens", icon: "key" },
@@ -99,13 +162,38 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
 
       <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 16, padding: "28px 28px 0", marginBottom: 0 }}>
         <div style={{ display: "flex", alignItems: "flex-start", gap: 18, paddingBottom: 24, borderBottom: "1px solid var(--border)" }}>
-          <div style={{
-            width: 56, height: 56, borderRadius: 14, background: "var(--accent-dim)",
-            display: "flex", alignItems: "center", justifyContent: "center",
-            fontFamily: "'Syne', sans-serif", fontWeight: 800, fontSize: 24, color: "var(--accent)", flexShrink: 0,
-          }}>
-            {initial}
+          <div
+            onClick={() => !uploadingAvatar && fileInputRef.current?.click()}
+            title={bot.exists_in_synapse ? "Avatar setzen (Klick)" : "Bot existiert nicht in Synapse"}
+            style={{
+              width: 56, height: 56, borderRadius: 14, background: "var(--accent-dim)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontFamily: "'Syne', sans-serif", fontWeight: 800, fontSize: 24, color: "var(--accent)",
+              flexShrink: 0, cursor: bot.exists_in_synapse ? "pointer" : "default",
+              overflow: "hidden", position: "relative",
+              opacity: uploadingAvatar ? 0.5 : 1,
+            }}>
+            {bot.avatar_url ? (
+              <img
+                src={`/api/media-thumbnail?mxc=${encodeURIComponent(bot.avatar_url)}&size=112`}
+                alt=""
+                style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                onError={e => { e.currentTarget.style.display = "none"; }}
+              />
+            ) : initial}
+            {uploadingAvatar && (
+              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.5)", fontSize: 9, color: "var(--text)", fontFamily: "'Space Mono', monospace" }}>
+                lade…
+              </div>
+            )}
           </div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            onChange={handleAvatarUpload}
+            style={{ display: "none" }}
+          />
           <div style={{ flex: 1, minWidth: 0 }}>
             {editing ? (
               <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -179,6 +267,29 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
                 <span style={{ fontFamily: "'Space Mono', monospace", fontSize: 12, color: "var(--text)" }}>{v}</span>
               </div>
             ))}
+
+            <div style={{ marginTop: 24, padding: 20, background: "rgba(255,77,77,0.06)", border: "1px solid rgba(255,77,77,0.25)", borderRadius: 10 }}>
+              <div style={{ fontFamily: "'Syne', sans-serif", fontWeight: 700, fontSize: 14, color: "#ff4d4d", marginBottom: 6 }}>
+                Danger Zone
+              </div>
+              <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: "var(--muted)", marginBottom: 14, lineHeight: 1.6 }}>
+                {bot.exists_in_synapse
+                  ? "„Aus Registry entfernen" lässt den Synapse-User in Ruhe — re-importierbar. „Permanent löschen" erased ihn endgültig."
+                  : "Der Synapse-Account fehlt bereits — der Registry-Eintrag ist verwaist und kann gefahrlos entfernt werden."}
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={deleteFromRegistry}
+                  style={{ ...btnGhostStyle, color: "#ffa94d", borderColor: "rgba(255,169,77,0.3)", fontSize: 12 }}>
+                  <Icon name="trash" size={13} /> Aus Registry entfernen
+                </button>
+                {bot.exists_in_synapse && (
+                  <button onClick={eraseSynapse}
+                    style={{ ...btnGhostStyle, color: "#ff4d4d", borderColor: "rgba(255,77,77,0.3)", fontSize: 12 }}>
+                    <Icon name="trash" size={13} /> Permanent löschen (Synapse-Erase)
+                  </button>
+                )}
+              </div>
+            </div>
           </div>
         )}
 

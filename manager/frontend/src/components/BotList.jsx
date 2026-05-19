@@ -7,7 +7,7 @@ import {
   modalOverlayStyle, modalStyle,
 } from "../styles.js";
 
-export function BotList({ config, onSelectBot, onOpenSettings, addToast }) {
+export function BotList({ config, onSelectBot, onOpenSettings, onOpenAudit, addToast }) {
   const [bots, setBots] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showCreate, setShowCreate] = useState(false);
@@ -64,6 +64,9 @@ export function BotList({ config, onSelectBot, onOpenSettings, addToast }) {
           <h1 style={{ fontFamily: "'Syne', sans-serif", fontSize: 26, fontWeight: 800, margin: 0, color: "var(--text)" }}>Bots</h1>
         </div>
         <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={onOpenAudit} style={btnGhostStyle} title="Audit-Log">
+            <Icon name="activity" size={15} />
+          </button>
           <button onClick={onOpenSettings} style={btnGhostStyle} title="Standard-Nutzer">
             <Icon name="users" size={15} />
           </button>
@@ -180,9 +183,16 @@ function BotCard({ bot, onClick }) {
           width: 40, height: 40, borderRadius: 10, background: "var(--accent-dim)",
           display: "flex", alignItems: "center", justifyContent: "center",
           fontFamily: "'Syne', sans-serif", fontWeight: 800, fontSize: 18, color: "var(--accent)",
-          flexShrink: 0,
+          flexShrink: 0, overflow: "hidden",
         }}>
-          {initial}
+          {bot.avatar_url ? (
+            <img
+              src={`/api/media-thumbnail?mxc=${encodeURIComponent(bot.avatar_url)}&size=80`}
+              alt=""
+              style={{ width: "100%", height: "100%", objectFit: "cover" }}
+              onError={e => { e.currentTarget.style.display = "none"; }}
+            />
+          ) : initial}
         </div>
         <div style={{ overflow: "hidden" }}>
           <div style={{ fontFamily: "'Syne', sans-serif", fontWeight: 700, fontSize: 15, color: "var(--text)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>

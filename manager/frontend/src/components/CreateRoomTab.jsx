@@ -1,17 +1,31 @@
 import { useState } from "react";
 import { Icon } from "./Icon.jsx";
-import { synapsePost, clientPost } from "../api.js";
+import { apiPost } from "../api.js";
 import {
   labelStyle, inputStyle, btnPrimaryStyle, btnGhostStyle,
 } from "../styles.js";
 
+function slugify(s) {
+  return s.toLowerCase()
+    .replace(/ä/g, "ae").replace(/ö/g, "oe").replace(/ü/g, "ue").replace(/ß/g, "ss")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
 export function CreateRoomTab({ bot, config, addToast, onRoomCreated }) {
   const [name, setName] = useState("");
   const [topic, setTopic] = useState("");
-  const [isEncrypted, setIsEncrypted] = useState(true);
+  const [alias, setAlias] = useState("");
+  const [aliasTouched, setAliasTouched] = useState(false);
+  const [isEncrypted, setIsEncrypted] = useState(false);
   const [isPublic, setIsPublic] = useState(false);
   const [extraMxid, setExtraMxid] = useState("");
   const [creating, setCreating] = useState(false);
+
+  function onNameChange(v) {
+    setName(v);
+    if (!aliasTouched) setAlias(slugify(v));
+  }
 
   // selected: { mxid, admin, selected }
   const [selected, setSelected] = useState(
@@ -49,49 +63,20 @@ export function CreateRoomTab({ bot, config, addToast, onRoomCreated }) {
     }
     setCreating(true);
     try {
-      // 1. Get bot's access token via Admin-API (Backend reicht Admin-Token an)
-      const tokenResp = await synapsePost(`/v1/users/${encodeURIComponent((bot.mxid || bot.name))}/login`);
-      const botToken = tokenResp.access_token;
-
-      // 2. Build createRoom payload
       const activeInvites = selected.filter(s => s.selected);
-      const inviteList = activeInvites.map(s => s.mxid);
-
-      const initialState = [];
-      if (isEncrypted) {
-        initialState.push({
-          type: "m.room.encryption",
-          state_key: "",
-          content: { algorithm: "m.megolm.v1.aes-sha2" },
-        });
-      }
-
-      // Power level overrides — bot is creator (100), set admins to 100
-      const userPowerLevels = { [(bot.mxid || bot.name)]: 100 };
-      activeInvites.filter(s => s.admin).forEach(s => {
-        userPowerLevels[s.mxid] = 100;
-      });
-
-      const payload = {
+      const mxid = bot.mxid || bot.name;
+      const result = await apiPost(`/bots/${encodeURIComponent(mxid)}/rooms`, {
         name: name.trim(),
-        topic: topic.trim() || undefined,
-        invite: inviteList,
-        preset: isPublic ? "public_chat" : "private_chat",
-        visibility: isPublic ? "public" : "private",
-        initial_state: initialState,
-        power_level_content_override: {
-          users: userPowerLevels,
-        },
-      };
-
-      // 3. Create room as bot (Client-API, Bot-Token im Header)
-      const result = await clientPost(botToken, "/createRoom", payload);
-
-      addToast(`Raum erstellt: ${result.room_id}`, "success");
-
-      // Reset form
-      setName("");
-      setTopic("");
+        topic: topic.trim() || null,
+        encrypted: isEncrypted,
+        public: isPublic,
+        alias_localpart: alias.trim() || null,
+        invites: activeInvites.map(s => ({
+          mxid: s.mxid, power_level: s.admin ? 100 : 0,
+        })),
+      });
+      addToast(`Raum erstellt: ${result.room_alias || result.room_id}`, "success");
+      setName(""); setTopic(""); setAlias(""); setAliasTouched(false);
       onRoomCreated();
     } catch (e) {
       addToast("Fehler beim Erstellen: " + e.message, "error");
@@ -112,7 +97,16 @@ export function CreateRoomTab({ bot, config, addToast, onRoomCreated }) {
       <div style={{ display: "flex", flexDirection: "column", gap: 14, marginBottom: 24 }}>
         <div>
           <label style={labelStyle}>Raumname</label>
-          <input style={inputStyle} value={name} onChange={e => setName(e.target.value)} placeholder="Notifications" />
+          <input style={inputStyle} value={name} onChange={e => onNameChange(e.target.value)} placeholder="Notifications" />
+        </div>
+        <div>
+          <label style={labelStyle}>Raum-Alias (optional)</label>
+          <input style={inputStyle} value={alias}
+            onChange={e => { setAliasTouched(true); setAlias(e.target.value.toLowerCase().replace(/\s/g, "-")); }}
+            placeholder="notifications" />
+          <div style={{ color: "var(--muted)", fontSize: 10, fontFamily: "'Space Mono', monospace", marginTop: 4 }}>
+            Ergibt #{alias || "raum-alias"}:server. Leer = nur Room-ID.
+          </div>
         </div>
         <div>
           <label style={labelStyle}>Topic (optional)</label>

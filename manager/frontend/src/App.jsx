@@ -4,6 +4,7 @@ import { Toast, useToast } from "./components/Toast.jsx";
 import { SettingsScreen } from "./components/SettingsScreen.jsx";
 import { BotList } from "./components/BotList.jsx";
 import { BotDetail } from "./components/BotDetail.jsx";
+import { AuditLog } from "./components/AuditLog.jsx";
 
 const LEGACY_LS_KEY = "matrix_bot_manager_config_v2";
 
@@ -61,6 +62,7 @@ export default function App() {
   const [bootError, setBootError] = useState(null);
   const [selectedBot, setSelectedBot] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [showAudit, setShowAudit] = useState(false);
   const { toasts, addToast } = useToast();
 
   const refreshDefaultUsers = useCallback(async () => {
@@ -119,6 +121,8 @@ export default function App() {
     );
   } else if (showSettings) {
     screen = <SettingsScreen config={config} onRefresh={refreshDefaultUsers} onBack={() => setShowSettings(false)} addToast={addToast} />;
+  } else if (showAudit) {
+    screen = <AuditLog onBack={() => setShowAudit(false)} addToast={addToast} />;
   } else if (selectedBot) {
     screen = <BotDetail bot={selectedBot} config={config} onBack={() => setSelectedBot(null)} addToast={addToast} />;
   } else {
@@ -127,6 +131,7 @@ export default function App() {
         config={config}
         onSelectBot={setSelectedBot}
         onOpenSettings={() => setShowSettings(true)}
+        onOpenAudit={() => setShowAudit(true)}
         addToast={addToast}
       />
     );
