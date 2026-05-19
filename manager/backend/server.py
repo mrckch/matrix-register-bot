@@ -1334,6 +1334,59 @@ async def api_remove_default_user(mxid: str):
 
 
 # ---------------------------------------------------------------------------
+# /api/diagnose — Hilfe bei "Invite ist da, aber Element zeigt nichts"
+# ---------------------------------------------------------------------------
+
+@app.get("/api/diagnose/user-invites/{user_mxid:path}")
+async def api_diagnose_user_invites(user_mxid: str, request: Request):
+    """Loggt sich via Admin-Login-as-User als der Ziel-User ein und ruft
+    /sync auf. Liefert die Liste aller offenen Einladungen, wie sie im
+    Sync-Stream des Users ankommen. Wenn der erwartete Raum hier drin
+    ist, ist Synapse OK -> Problem liegt bei Element (Sync-Hiccup,
+    falscher Account, Cache). Wenn er fehlt, hat Synapse den Invite nicht
+    in den Stream gestellt -> ggf. Synapse-Neustart oder Konfig-Issue."""
+    if not user_mxid.startswith("@") or ":" not in user_mxid:
+        raise HTTPException(400, "user_mxid muss @user:server sein")
+
+    http = request.app.state.http
+    try:
+        user_token = await _admin_login_as(http, user_mxid)
+    except HTTPException as e:
+        raise HTTPException(e.status_code,
+                            f"Konnte nicht als {user_mxid} loggen — User existiert? ({e.detail})")
+
+    r = await http.get(
+        f"{SYNAPSE_URL}/_matrix/client/v3/sync",
+        headers={"Authorization": f"Bearer {user_token}"},
+        params={"timeout": "0", "full_state": "false"},
+    )
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"Sync fehlgeschlagen: {r.text}")
+
+    data = r.json()
+    invite_rooms = data.get("rooms", {}).get("invite", {})
+
+    summary = []
+    for rid, inv in invite_rooms.items():
+        # invite_state.events enthaelt "stripped state": Name, Avatar, Creator etc.
+        name = None
+        inviter = None
+        for ev in inv.get("invite_state", {}).get("events", []):
+            if ev.get("type") == "m.room.name":
+                name = ev.get("content", {}).get("name")
+            if ev.get("type") == "m.room.member" and ev.get("state_key") == user_mxid:
+                inviter = ev.get("sender")
+        summary.append({"room_id": rid, "name": name, "inviter": inviter})
+
+    return {
+        "user": user_mxid,
+        "invite_count": len(invite_rooms),
+        "rooms": summary,
+        "next_batch": data.get("next_batch"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # /api/discovery — fuer Bot-Import-Modal
 # ---------------------------------------------------------------------------
 

@@ -433,6 +433,35 @@ function RoomRow({ bot, room, config, addToast, onChanged }) {
                     <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m}</span>
                     <button
                       onClick={async () => {
+                        try {
+                          const d = await apiGet(`/diagnose/user-invites/${encodeURIComponent(m)}`);
+                          const found = d.rooms.find(r => r.room_id === room.room_id);
+                          if (found) {
+                            addToast(
+                              `✓ ${m} sieht ${d.invite_count} Invite(s), DIESER Raum ist dabei. ` +
+                              `Synapse OK — Element-Problem: Element neu starten / abmelden+anmelden / richtiger Account?`,
+                              "success",
+                            );
+                          } else {
+                            addToast(
+                              `✗ ${m} sieht ${d.invite_count} Invite(s), aber NICHT diesen Raum. ` +
+                              `Synapse hat den Invite nicht im Sync-Stream. „Nochmal" probieren oder Synapse neu starten.`,
+                              "error",
+                            );
+                          }
+                        } catch (e) {
+                          addToast("Diagnose-Fehler: " + e.message, "error");
+                        }
+                      }}
+                      style={{
+                        ...btnGhostStyle, padding: "2px 8px", fontSize: 10,
+                      }}
+                      title="Prüfen: Sieht der User den Invite in seinem /sync?"
+                    >
+                      Diagnose
+                    </button>
+                    <button
+                      onClick={async () => {
                         if (!confirm(`Einladung an ${m} erneut senden? (Kick + frischer Invite — Element bekommt's beim naechsten Sync)`)) return;
                         try {
                           await apiPost(
