@@ -35,6 +35,11 @@ das laufende Drumherum (Token rotieren, Raeume anlegen, Bots loeschen).
   Standard-User-Liste waehlen, Nachricht eintippen, Bot legt einen 1:1-DM
   an (oder nutzt einen bestehenden) und postet die Nachricht. Praktisch
   zum Verifizieren, ob ein Bot wirklich senden kann.
+- **Nachtraegliches Einladen** — der Raeume-Tab listet pro Raum Name,
+  Topic, Member-Count und ist aufklappbar. Im aufgeklappten Bereich gibt's
+  einen Dropdown mit Standard-Usern (gefiltert: nicht schon drin/eingeladen),
+  Power-Level-Auswahl und einen "Einladen"-Knopf. Plus ein Ad-hoc-Feld
+  fuer User ausserhalb der Standard-Liste.
 - **Avatar pro Bot** — Klick auf den Avatar-Kreis im Bot-Detail öffnet
   einen Picker mit **15 mitgelieferten SVG-Avataren** im gleichen Stil
   (Roboter, Tiere, Symbole) ODER File-Upload. Built-in-SVGs werden

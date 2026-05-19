@@ -479,16 +479,149 @@ async def api_media_thumbnail(request: Request, mxc: str, size: int = 96):
     )
 
 
+class InviteToRoom(BaseModel):
+    user_mxid: str
+    power_level: int | None = None  # None = keinen PL setzen, 0/50/100 = setzen
+
+
 @app.get("/api/bots/{mxid}/rooms")
 async def api_bot_rooms(mxid: str, request: Request):
-    """Beigetretene Raeume eines Bots."""
+    """Beigetretene Raeume eines Bots — angereichert mit Name, Topic,
+    Mitgliederzahl und Member-Liste."""
     if not await get_bot(mxid):
         raise HTTPException(404, f"Bot {mxid} nicht in der Registry")
-    r = await _admin_get(request.app.state.http,
-                         f"/_synapse/admin/v1/users/{_q(mxid)}/joined_rooms")
+
+    http = request.app.state.http
+    r = await _admin_get(http, f"/_synapse/admin/v1/users/{_q(mxid)}/joined_rooms")
     if r.status_code != 200:
         raise HTTPException(r.status_code, f"Synapse: {r.text}")
-    return r.json()
+    room_ids = r.json().get("joined_rooms", [])
+
+    # Fuer State-Reads brauchen wir einen Bot-Token (Admin-Token darf nicht
+    # in fremden Raeumen lesen, der Bot darf in seinen eigenen).
+    bot_token = None
+    if room_ids:
+        try:
+            bot_token = await _admin_login_as(http, mxid)
+        except HTTPException:
+            bot_token = None
+
+    rooms: list[dict[str, Any]] = []
+    for rid in room_ids:
+        info: dict[str, Any] = {"room_id": rid}
+        if bot_token:
+            auth = {"Authorization": f"Bearer {bot_token}"}
+            # Name
+            try:
+                nr = await http.get(
+                    f"{SYNAPSE_URL}/_matrix/client/v3/rooms/{_q(rid)}/state/m.room.name",
+                    headers=auth)
+                if nr.status_code == 200:
+                    info["name"] = nr.json().get("name")
+            except httpx.HTTPError:
+                pass
+            # Topic
+            try:
+                tr = await http.get(
+                    f"{SYNAPSE_URL}/_matrix/client/v3/rooms/{_q(rid)}/state/m.room.topic",
+                    headers=auth)
+                if tr.status_code == 200:
+                    info["topic"] = tr.json().get("topic")
+            except httpx.HTTPError:
+                pass
+            # Canonical alias
+            try:
+                ar = await http.get(
+                    f"{SYNAPSE_URL}/_matrix/client/v3/rooms/{_q(rid)}/state/m.room.canonical_alias",
+                    headers=auth)
+                if ar.status_code == 200:
+                    info["alias"] = ar.json().get("alias")
+            except httpx.HTTPError:
+                pass
+            # Members (joined + invited)
+            try:
+                mr = await http.get(
+                    f"{SYNAPSE_URL}/_matrix/client/v3/rooms/{_q(rid)}/members",
+                    headers=auth)
+                if mr.status_code == 200:
+                    joined: list[str] = []
+                    invited: list[str] = []
+                    for ev in mr.json().get("chunk", []):
+                        mship = ev.get("content", {}).get("membership")
+                        sk = ev.get("state_key")
+                        if mship == "join":
+                            joined.append(sk)
+                        elif mship == "invite":
+                            invited.append(sk)
+                    info["joined_members"] = joined
+                    info["invited_members"] = invited
+                    info["member_count"] = len(joined)
+            except httpx.HTTPError:
+                pass
+        rooms.append(info)
+
+    return {"joined_rooms": room_ids, "rooms": rooms}
+
+
+@app.post("/api/bots/{mxid}/rooms/{room_id}/invite")
+async def api_invite_to_room(mxid: str, room_id: str, payload: InviteToRoom,
+                             request: Request):
+    """Lädt einen User in einen bestehenden Raum ein und setzt optional
+    seinen Power-Level. Der Bot agiert als Inviter, deshalb braucht der
+    Bot Membership + PL >= invite_level im Raum (Default 0).
+    """
+    if not await get_bot(mxid):
+        raise HTTPException(404, f"Bot {mxid} nicht in der Registry")
+    target = payload.user_mxid.strip()
+    if not target.startswith("@") or ":" not in target:
+        raise HTTPException(400, "user_mxid muss @user:server sein")
+    if target == mxid:
+        raise HTTPException(400, "Bot ist bereits selbst im Raum")
+
+    http = request.app.state.http
+    bot_token = await _admin_login_as(http, mxid)
+    auth = {"Authorization": f"Bearer {bot_token}", "Content-Type": "application/json"}
+
+    # 1) Invite senden
+    r = await http.post(
+        f"{SYNAPSE_URL}/_matrix/client/v3/rooms/{_q(room_id)}/invite",
+        headers=auth,
+        json={"user_id": target},
+    )
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"Invite fehlgeschlagen: {r.text}")
+
+    # 2) Optional Power-Level setzen (durch Read-Modify-Write des PL-Events)
+    if payload.power_level is not None and payload.power_level > 0:
+        get_pl = await http.get(
+            f"{SYNAPSE_URL}/_matrix/client/v3/rooms/{_q(room_id)}/state/m.room.power_levels",
+            headers={"Authorization": f"Bearer {bot_token}"},
+        )
+        if get_pl.status_code != 200:
+            raise HTTPException(get_pl.status_code,
+                                f"PL-Read fehlgeschlagen: {get_pl.text}")
+        pl_content = get_pl.json()
+        users = pl_content.setdefault("users", {})
+        users[target] = payload.power_level
+        put_pl = await http.put(
+            f"{SYNAPSE_URL}/_matrix/client/v3/rooms/{_q(room_id)}/state/m.room.power_levels",
+            headers=auth,
+            json=pl_content,
+        )
+        if put_pl.status_code != 200:
+            raise HTTPException(put_pl.status_code,
+                                f"PL-Set fehlgeschlagen: {put_pl.text}")
+
+    await log_audit("invite_to_room", mxid, {
+        "room_id": room_id, "user": target,
+        "power_level": payload.power_level,
+    })
+    return {
+        "status": "invited",
+        "room_id": room_id,
+        "user_mxid": target,
+        "power_level": payload.power_level,
+    }
 
 
 # ---------------------------------------------------------------------------

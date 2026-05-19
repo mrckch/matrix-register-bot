@@ -27,7 +27,12 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
     setLoadingRooms(true);
     try {
       const data = await apiGet(`/bots/${encodeURIComponent(mxid)}/rooms`);
-      setRooms(data.joined_rooms || []);
+      // Bevorzugt das angereicherte `rooms`-Array, fallback auf joined_rooms-Strings.
+      if (Array.isArray(data.rooms) && data.rooms.length === (data.joined_rooms || []).length) {
+        setRooms(data.rooms);
+      } else {
+        setRooms((data.joined_rooms || []).map(rid => ({ room_id: rid })));
+      }
     } catch (e) {
       addToast("Fehler beim Laden der Räume: " + e.message, "error");
     } finally {
@@ -296,18 +301,24 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
                 Dieser Bot ist in keinen Räumen.
               </div>
             ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: "var(--muted)", marginBottom: 8 }}>
-                  {rooms.length} {rooms.length === 1 ? "Raum" : "Räume"}
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: "var(--muted)" }}>
+                    {rooms.length} {rooms.length === 1 ? "Raum" : "Räume"}
+                  </span>
+                  <button onClick={fetchRooms} style={{ ...btnGhostStyle, fontSize: 11 }} title="Neu laden">
+                    <Icon name="refresh" size={11} />
+                  </button>
                 </div>
-                {rooms.map((roomId) => (
-                  <div key={roomId} style={{
-                    display: "flex", alignItems: "center", gap: 12,
-                    padding: "12px 14px", background: "var(--bg)", borderRadius: 8, border: "1px solid var(--border)",
-                  }}>
-                    <div style={{ color: "var(--accent)", opacity: 0.7 }}><Icon name="rooms" size={14} /></div>
-                    <span style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: "var(--text)" }}>{roomId}</span>
-                  </div>
+                {rooms.map((room) => (
+                  <RoomRow
+                    key={room.room_id}
+                    bot={bot}
+                    room={room}
+                    config={config}
+                    addToast={addToast}
+                    onChanged={fetchRooms}
+                  />
                 ))}
               </div>
             )}
@@ -328,6 +339,141 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
             setShowAvatarPicker(false);
           }}
         />
+      )}
+    </div>
+  );
+}
+
+function RoomRow({ bot, room, config, addToast, onChanged }) {
+  const [expanded, setExpanded] = useState(false);
+  const [inviting, setInviting] = useState(false);
+  const [defaultUsers] = useState(config.defaultUsers || []);
+  const presentMxids = new Set([...(room.joined_members || []), ...(room.invited_members || [])]);
+  const inviteCandidates = defaultUsers.filter(u =>
+    u.mxid !== (bot.mxid || bot.name) && !presentMxids.has(u.mxid)
+  );
+  const [chosenMxid, setChosenMxid] = useState(inviteCandidates[0]?.mxid || "");
+  const [chosenPL, setChosenPL] = useState(0);
+  const [adhocMxid, setAdhocMxid] = useState("");
+
+  async function doInvite(target) {
+    setInviting(true);
+    try {
+      await apiPost(
+        `/bots/${encodeURIComponent(bot.mxid || bot.name)}/rooms/${encodeURIComponent(room.room_id)}/invite`,
+        { user_mxid: target, power_level: chosenPL > 0 ? chosenPL : null },
+      );
+      addToast(`${target} eingeladen${chosenPL > 0 ? ` (PL ${chosenPL})` : ""}`, "success");
+      setExpanded(false);
+      setAdhocMxid("");
+      onChanged?.();
+    } catch (e) {
+      addToast("Invite-Fehler: " + e.message, "error");
+    } finally {
+      setInviting(false);
+    }
+  }
+
+  const title = room.name || room.alias || room.room_id;
+
+  return (
+    <div style={{
+      background: "var(--bg)", borderRadius: 8, border: "1px solid var(--border)",
+    }}>
+      <div style={{
+        display: "flex", alignItems: "center", gap: 12, padding: "12px 14px",
+        cursor: "pointer",
+      }} onClick={() => setExpanded(e => !e)}>
+        <div style={{ color: "var(--accent)", opacity: 0.7 }}><Icon name="rooms" size={14} /></div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontFamily: "'Syne', sans-serif", fontWeight: 700, fontSize: 13, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {title}
+          </div>
+          <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 10, color: "var(--muted)", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {room.alias || room.room_id}
+            {typeof room.member_count === "number" && (
+              <> · {room.member_count} {room.member_count === 1 ? "Mitglied" : "Mitglieder"}</>
+            )}
+            {(room.invited_members || []).length > 0 && (
+              <> · {(room.invited_members || []).length} offene Invites</>
+            )}
+          </div>
+        </div>
+        <a href={`https://matrix.to/#/${room.alias || room.room_id}`} target="_blank" rel="noopener noreferrer"
+           onClick={e => e.stopPropagation()}
+           style={{ color: "var(--accent)", textDecoration: "none", padding: "4px 8px", fontFamily: "'Space Mono', monospace", fontSize: 11 }}
+           title="In Element öffnen">↗</a>
+      </div>
+      {expanded && (
+        <div style={{ padding: "0 14px 14px", borderTop: "1px solid var(--border)" }}>
+          {(room.joined_members || []).length > 0 && (
+            <div style={{ marginTop: 12 }}>
+              <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 10, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>Mitglieder</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                {(room.joined_members || []).map(m => (
+                  <span key={m} style={{ ...badgeStyle, fontSize: 10 }}>{m}</span>
+                ))}
+              </div>
+            </div>
+          )}
+          {(room.invited_members || []).length > 0 && (
+            <div style={{ marginTop: 10 }}>
+              <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 10, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>Offene Einladungen</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                {(room.invited_members || []).map(m => (
+                  <span key={m} style={{ ...badgeStyle, fontSize: 10, color: "#ffa94d", border: "1px solid rgba(255,169,77,0.3)" }}>{m}</span>
+                ))}
+              </div>
+            </div>
+          )}
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 10, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>Einladen</div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {inviteCandidates.length > 0 ? (
+                <select
+                  value={chosenMxid}
+                  onChange={e => setChosenMxid(e.target.value)}
+                  style={{ ...inputStyle, appearance: "auto", flex: 1, minWidth: 200, margin: 0 }}>
+                  {inviteCandidates.map(u => <option key={u.mxid} value={u.mxid}>{u.mxid}</option>)}
+                </select>
+              ) : (
+                <span style={{ flex: 1, fontFamily: "'Space Mono', monospace", fontSize: 11, color: "var(--muted)", padding: "8px 12px" }}>
+                  Alle Standard-User sind schon drin oder eingeladen.
+                </span>
+              )}
+              <select
+                value={chosenPL}
+                onChange={e => setChosenPL(parseInt(e.target.value, 10))}
+                style={{ ...inputStyle, appearance: "auto", width: 120, margin: 0 }}>
+                <option value={0}>Standard</option>
+                <option value={50}>Moderator</option>
+                <option value={100}>Admin</option>
+              </select>
+              <button
+                onClick={() => chosenMxid && doInvite(chosenMxid)}
+                disabled={inviting || !chosenMxid}
+                style={btnPrimaryStyle}>
+                <Icon name="plus" size={12} /> Einladen
+              </button>
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+              <input
+                value={adhocMxid}
+                onChange={e => setAdhocMxid(e.target.value)}
+                placeholder="@adhoc:server.de — anderen User einladen"
+                onKeyDown={e => {
+                  if (e.key === "Enter" && adhocMxid.trim()) doInvite(adhocMxid.trim());
+                }}
+                style={{ ...inputStyle, flex: 1, margin: 0 }} />
+              <button
+                onClick={() => adhocMxid.trim() && doInvite(adhocMxid.trim())}
+                disabled={inviting || !adhocMxid.trim()}
+                style={btnGhostStyle}>
+                <Icon name="plus" size={12} /> Ad-hoc
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
