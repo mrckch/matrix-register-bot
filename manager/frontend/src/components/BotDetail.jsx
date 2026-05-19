@@ -237,8 +237,8 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
               </div>
               <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: "var(--muted)", marginBottom: 14, lineHeight: 1.6 }}>
                 {bot.exists_in_synapse
-                  ? "„Aus Registry entfernen" lässt den Synapse-User in Ruhe — re-importierbar. „Permanent löschen" erased ihn endgültig."
-                  : "Der Synapse-Account fehlt bereits — der Registry-Eintrag ist verwaist und kann gefahrlos entfernt werden."}
+                  ? `'Aus Registry entfernen' lässt den Synapse-User in Ruhe — re-importierbar. 'Permanent löschen' erased ihn endgültig.`
+                  : `Der Synapse-Account fehlt bereits — der Registry-Eintrag ist verwaist und kann gefahrlos entfernt werden.`}
               </div>
               <div style={{ display: "flex", gap: 8 }}>
                 <button onClick={deleteFromRegistry}
