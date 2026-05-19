@@ -76,6 +76,14 @@ export function CreateRoomTab({ bot, config, addToast, onRoomCreated }) {
         })),
       });
       addToast(`Raum erstellt: ${result.room_alias || result.room_id}`, "success");
+      const failed = result.failed_invites || [];
+      if (failed.length > 0) {
+        addToast(
+          `Achtung: ${failed.length} Invite(s) fehlgeschlagen — ${failed.join(", ")}. ` +
+          `Synapse-Logs prüfen (Rate-Limit? Block-Policy?).`,
+          "error",
+        );
+      }
       setName(""); setTopic(""); setAlias(""); setAliasTouched(false);
       onRoomCreated();
     } catch (e) {

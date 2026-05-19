@@ -677,9 +677,36 @@ async def _create_room_as_bot(
     if r.status_code != 200:
         raise HTTPException(r.status_code, f"createRoom: {r.text}")
     data = r.json()
+    room_id = data.get("room_id")
+
+    # Sanity-Check: Synapses createRoom quittiert immer mit 200, auch wenn
+    # einzelne Invites silent failen (Rate-Limit, deactivated user, ACL).
+    # Wir lesen die Member-Liste und melden, was fehlt — sonst merkt man's
+    # erst, wenn der Eingeladene nichts in Element sieht.
+    failed_invites: list[str] = []
+    invited_mxids = [inv.mxid for inv in invites]
+    if room_id and invited_mxids:
+        try:
+            m = await http.get(
+                f"{SYNAPSE_URL}/_matrix/client/v3/rooms/{_q(room_id)}/members",
+                headers={"Authorization": f"Bearer {bot_token}"},
+            )
+            if m.status_code == 200:
+                present = set()
+                for ev in m.json().get("chunk", []):
+                    membership = ev.get("content", {}).get("membership")
+                    if membership in ("invite", "join"):
+                        present.add(ev.get("state_key"))
+                failed_invites = [mx for mx in invited_mxids if mx not in present]
+        except httpx.HTTPError:
+            # Nicht-kritisch — wenn die Verifikation selbst scheitert,
+            # bleibt failed_invites leer und der Caller geht von Erfolg aus.
+            pass
+
     return {
-        "room_id": data.get("room_id"),
+        "room_id": room_id,
         "room_alias": data.get("room_alias"),
+        "failed_invites": failed_invites,
     }
 
 
@@ -697,12 +724,15 @@ async def api_create_room_for_bot(mxid: str, payload: RoomCreate, request: Reque
         alias_localpart=payload.alias_localpart,
         invites=payload.invites,
     )
-    await log_audit("create_room", mxid, {
+    audit_detail = {
         "room_id": result["room_id"],
         "room_alias": result.get("room_alias"),
         "name": payload.name,
         "n_invites": len(payload.invites),
-    })
+    }
+    if result.get("failed_invites"):
+        audit_detail["failed_invites"] = result["failed_invites"]
+    await log_audit("create_room", mxid, audit_detail)
     result["matrix_to"] = f"https://matrix.to/#/{result['room_id']}"
     return result
 
@@ -853,23 +883,28 @@ async def api_wizard_setup_bot(payload: WizardSetup, request: Request):
 
     n_invites = len(payload.room.invites)
     n_admins = sum(1 for inv in payload.room.invites if inv.power_level >= 100)
+    failed = room.get("failed_invites") or []
     detail = f"{room['room_id']} ({n_invites} eingeladen"
     if n_admins:
         detail += f", {n_admins} davon Admin"
     if room.get("room_alias"):
         detail += f", Alias {room['room_alias']}"
     detail += ")"
+    if failed:
+        detail += f" — WARNUNG: {len(failed)} Invite(s) fehlgeschlagen: {', '.join(failed)}"
     result["room"] = {
         "room_id": room["room_id"],
         "room_alias": room.get("room_alias"),
         "matrix_to": f"https://matrix.to/#/{room.get('room_alias') or room['room_id']}",
+        "failed_invites": failed,
     }
-    add_step("create_room", "ok", detail)
+    add_step("create_room", "warning" if failed else "ok", detail)
 
     await log_audit("wizard_setup", mxid, {
         "room_id": room["room_id"], "room_alias": room.get("room_alias"),
         "room_name": payload.room.name,
         "n_invites": n_invites, "n_admins": n_admins,
+        "failed_invites": failed,
         "encrypted": payload.room.encrypted, "public": payload.room.public,
     })
 

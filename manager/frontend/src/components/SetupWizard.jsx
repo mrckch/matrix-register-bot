@@ -535,12 +535,16 @@ function Step5({ result, addToast }) {
 }
 
 function StepResult({ step }) {
-  const icon = step.status === "ok" ? "check" : step.status === "skipped" ? "x" : "x";
-  const color = step.status === "ok" ? "var(--accent)" : step.status === "skipped" ? "var(--muted)" : "#ff4d4d";
+  const icon = step.status === "ok" ? "check" : "x";
+  const color = step.status === "ok" ? "var(--accent)"
+              : step.status === "warning" ? "#ffa94d"
+              : step.status === "skipped" ? "var(--muted)"
+              : "#ff4d4d";
   const labels = {
     create_bot: "Bot anlegen",
     create_token: "Token erzeugen",
     create_room: "Raum anlegen",
+    set_avatar: "Avatar setzen",
   };
   return (
     <div style={{
