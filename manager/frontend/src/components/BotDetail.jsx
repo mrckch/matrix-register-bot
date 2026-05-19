@@ -1,8 +1,9 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { Icon } from "./Icon.jsx";
-import { apiGet, apiPut, apiDelete, apiUpload } from "../api.js";
+import { apiGet, apiPut, apiDelete } from "../api.js";
 import { CreateRoomTab } from "./CreateRoomTab.jsx";
 import { TokenTab } from "./TokenTab.jsx";
+import { AvatarPicker } from "./AvatarPicker.jsx";
 import {
   inputStyle, btnPrimaryStyle, btnGhostStyle, badgeStyle,
 } from "../styles.js";
@@ -16,8 +17,7 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
   const [saving, setSaving] = useState(false);
   const [togglingActive, setTogglingActive] = useState(false);
   const [activeTab, setActiveTab] = useState("overview");
-  const [uploadingAvatar, setUploadingAvatar] = useState(false);
-  const fileInputRef = useRef(null);
+  const [showAvatarPicker, setShowAvatarPicker] = useState(false);
 
   const mxid = bot.mxid || bot.name;
   const localpart = bot.localpart || mxid.split(":")[0].replace("@", "");
@@ -101,30 +101,6 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
     }
   }
 
-  async function handleAvatarUpload(e) {
-    const file = e.target.files?.[0];
-    e.target.value = "";  // damit dieselbe Datei nochmal geht
-    if (!file) return;
-    if (!file.type.startsWith("image/")) {
-      addToast("Bitte eine Bilddatei wählen", "error");
-      return;
-    }
-    if (file.size > 8 * 1024 * 1024) {
-      addToast("Datei zu groß (max 8 MB)", "error");
-      return;
-    }
-    setUploadingAvatar(true);
-    try {
-      const r = await apiUpload(`/bots/${encodeURIComponent(mxid)}/avatar`, file);
-      setBot(b => ({ ...b, avatar_url: r.avatar_url }));
-      addToast("Avatar gesetzt", "success");
-    } catch (err) {
-      addToast("Avatar-Fehler: " + err.message, "error");
-    } finally {
-      setUploadingAvatar(false);
-    }
-  }
-
   async function eraseSynapse() {
     const phrase = `lösche ${localpart}`;
     const answer = prompt(
@@ -163,15 +139,14 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
       <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 16, padding: "28px 28px 0", marginBottom: 0 }}>
         <div style={{ display: "flex", alignItems: "flex-start", gap: 18, paddingBottom: 24, borderBottom: "1px solid var(--border)" }}>
           <div
-            onClick={() => !uploadingAvatar && fileInputRef.current?.click()}
-            title={bot.exists_in_synapse ? "Avatar setzen (Klick)" : "Bot existiert nicht in Synapse"}
+            onClick={() => bot.exists_in_synapse && setShowAvatarPicker(true)}
+            title={bot.exists_in_synapse ? "Avatar wählen (Klick)" : "Bot existiert nicht in Synapse"}
             style={{
               width: 56, height: 56, borderRadius: 14, background: "var(--accent-dim)",
               display: "flex", alignItems: "center", justifyContent: "center",
               fontFamily: "'Syne', sans-serif", fontWeight: 800, fontSize: 24, color: "var(--accent)",
               flexShrink: 0, cursor: bot.exists_in_synapse ? "pointer" : "default",
               overflow: "hidden", position: "relative",
-              opacity: uploadingAvatar ? 0.5 : 1,
             }}>
             {bot.avatar_url ? (
               <img
@@ -181,19 +156,7 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
                 onError={e => { e.currentTarget.style.display = "none"; }}
               />
             ) : initial}
-            {uploadingAvatar && (
-              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.5)", fontSize: 9, color: "var(--text)", fontFamily: "'Space Mono', monospace" }}>
-                lade…
-              </div>
-            )}
           </div>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*"
-            onChange={handleAvatarUpload}
-            style={{ display: "none" }}
-          />
           <div style={{ flex: 1, minWidth: 0 }}>
             {editing ? (
               <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -331,6 +294,18 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
           <CreateRoomTab bot={bot} config={config} addToast={addToast} onRoomCreated={() => { setRooms(null); setActiveTab("rooms"); }} />
         )}
       </div>
+
+      {showAvatarPicker && (
+        <AvatarPicker
+          mxid={mxid}
+          addToast={addToast}
+          onClose={() => setShowAvatarPicker(false)}
+          onApplied={(avatar_url) => {
+            setBot(b => ({ ...b, avatar_url }));
+            setShowAvatarPicker(false);
+          }}
+        />
+      )}
     </div>
   );
 }

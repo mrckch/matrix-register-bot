@@ -20,8 +20,10 @@ das laufende Drumherum (Token rotieren, Raeume anlegen, Bots loeschen).
   Wizard-Setup, Standard-User-Pflege, Permanent-Löschung) landet in der
   Manager-DB und ist im UI durchsuchbar (Activity-Icon im Header).
 - **Avatar pro Bot** — Klick auf den Avatar-Kreis im Bot-Detail öffnet
-  einen File-Picker, Bild wird ins Synapse-Media-Repo geladen und als
-  avatar_url gesetzt. Funktioniert auch in Element und Ketesa.
+  einen Picker mit **15 mitgelieferten SVG-Avataren** im gleichen Stil
+  (Roboter, Tiere, Symbole) ODER File-Upload. Built-in-SVGs werden
+  client-seitig zu 256×256-PNG rasterisiert, damit Synapses Thumbnail-
+  Endpoint sie sauber liefert. Funktioniert auch in Element und Ketesa.
 - **Bot dauerhaft löschen** — Danger-Zone im Bot-Detail mit zwei Stufen:
   „Aus Registry entfernen" (re-importierbar) oder „Permanent löschen"
   (Synapse erase via Admin-API, hard confirm per Texteingabe).
