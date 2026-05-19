@@ -624,6 +624,78 @@ async def api_invite_to_room(mxid: str, room_id: str, payload: InviteToRoom,
     }
 
 
+@app.post("/api/bots/{mxid}/rooms/{room_id}/reinvite")
+async def api_reinvite_to_room(mxid: str, room_id: str, payload: InviteToRoom,
+                                request: Request):
+    """Kickt eine bestehende Membership (invite oder join) und sendet
+    danach eine frische Einladung. Erzeugt zwei neue Events, die der
+    Client beim naechsten Sync sicher mitbekommt — nuetzlich wenn der
+    ursprueliche Invite untergegangen ist (Element nicht offen,
+    Sync-Hiccup, alte Session etc.).
+    """
+    if not await get_bot(mxid):
+        raise HTTPException(404, f"Bot {mxid} nicht in der Registry")
+    target = payload.user_mxid.strip()
+    if not target.startswith("@") or ":" not in target:
+        raise HTTPException(400, "user_mxid muss @user:server sein")
+    if target == mxid:
+        raise HTTPException(400, "Bot kann sich nicht selbst neu einladen")
+
+    http = request.app.state.http
+    bot_token = await _admin_login_as(http, mxid)
+    auth = {"Authorization": f"Bearer {bot_token}", "Content-Type": "application/json"}
+
+    # 1) Kick — entfernt Membership. 403/404 schlucken wir, falls User nicht drin
+    #    war (dann ist es einfach ein normales Invite).
+    kicked = False
+    kick = await http.post(
+        f"{SYNAPSE_URL}/_matrix/client/v3/rooms/{_q(room_id)}/kick",
+        headers=auth,
+        json={"user_id": target, "reason": "Einladung wird erneut gesendet"},
+    )
+    if kick.status_code == 200:
+        kicked = True
+    elif kick.status_code not in (403, 404):
+        # 403 = nicht im Raum, 404 = Raum nicht da. Andere Fehler hochwerfen.
+        raise HTTPException(kick.status_code, f"Kick fehlgeschlagen: {kick.text}")
+
+    # 2) Frischer Invite
+    inv = await http.post(
+        f"{SYNAPSE_URL}/_matrix/client/v3/rooms/{_q(room_id)}/invite",
+        headers=auth,
+        json={"user_id": target},
+    )
+    if inv.status_code != 200:
+        raise HTTPException(inv.status_code, f"Invite fehlgeschlagen: {inv.text}")
+
+    # 3) Optional Power-Level
+    if payload.power_level is not None and payload.power_level > 0:
+        get_pl = await http.get(
+            f"{SYNAPSE_URL}/_matrix/client/v3/rooms/{_q(room_id)}/state/m.room.power_levels",
+            headers={"Authorization": f"Bearer {bot_token}"},
+        )
+        if get_pl.status_code == 200:
+            pl_content = get_pl.json()
+            pl_content.setdefault("users", {})[target] = payload.power_level
+            await http.put(
+                f"{SYNAPSE_URL}/_matrix/client/v3/rooms/{_q(room_id)}/state/m.room.power_levels",
+                headers=auth,
+                json=pl_content,
+            )
+
+    await log_audit("reinvite_to_room", mxid, {
+        "room_id": room_id, "user": target,
+        "kicked_first": kicked,
+        "power_level": payload.power_level,
+    })
+    return {
+        "status": "reinvited",
+        "room_id": room_id,
+        "user_mxid": target,
+        "kicked_first": kicked,
+    }
+
+
 # ---------------------------------------------------------------------------
 # /api/bots/{mxid}/tokens — Token-Verwaltung
 # ---------------------------------------------------------------------------

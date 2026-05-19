@@ -419,9 +419,41 @@ function RoomRow({ bot, room, config, addToast, onChanged }) {
           {(room.invited_members || []).length > 0 && (
             <div style={{ marginTop: 10 }}>
               <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 10, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>Offene Einladungen</div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                 {(room.invited_members || []).map(m => (
-                  <span key={m} style={{ ...badgeStyle, fontSize: 10, color: "#ffa94d", border: "1px solid rgba(255,169,77,0.3)" }}>{m}</span>
+                  <div key={m} style={{
+                    display: "flex", alignItems: "center", gap: 6,
+                    padding: "6px 10px",
+                    background: "rgba(255,169,77,0.06)",
+                    border: "1px solid rgba(255,169,77,0.3)",
+                    borderRadius: 6,
+                    fontFamily: "'Space Mono', monospace", fontSize: 11,
+                    color: "#ffa94d",
+                  }}>
+                    <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m}</span>
+                    <button
+                      onClick={async () => {
+                        if (!confirm(`Einladung an ${m} erneut senden? (Kick + frischer Invite — Element bekommt's beim naechsten Sync)`)) return;
+                        try {
+                          await apiPost(
+                            `/bots/${encodeURIComponent(bot.mxid || bot.name)}/rooms/${encodeURIComponent(room.room_id)}/reinvite`,
+                            { user_mxid: m, power_level: null },
+                          );
+                          addToast(`Einladung an ${m} neu gesendet`, "success");
+                          onChanged?.();
+                        } catch (e) {
+                          addToast("Fehler: " + e.message, "error");
+                        }
+                      }}
+                      style={{
+                        ...btnGhostStyle, padding: "2px 8px", fontSize: 10,
+                        color: "#ffa94d", borderColor: "rgba(255,169,77,0.4)",
+                      }}
+                      title="Einladung neu senden (Kick + Invite)"
+                    >
+                      <Icon name="refresh" size={10} /> Nochmal
+                    </button>
+                  </div>
                 ))}
               </div>
             </div>
