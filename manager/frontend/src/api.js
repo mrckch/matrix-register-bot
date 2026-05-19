@@ -14,6 +14,12 @@ async function readError(response) {
   try {
     const data = await response.json();
     if (typeof data.detail === "string") return data.detail;
+    // FastAPI-Validierungsfehler: detail = Array of {loc, msg, type}
+    if (Array.isArray(data.detail) && data.detail.length > 0) {
+      return data.detail
+        .map(d => `${(d.loc || []).slice(1).join(".") || "body"}: ${d.msg}`)
+        .join(" · ");
+    }
     return data.error || data.errcode || `${response.status} ${response.statusText}`;
   } catch {
     return `${response.status} ${response.statusText}`;
