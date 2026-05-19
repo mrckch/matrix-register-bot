@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Icon } from "./Icon.jsx";
-import { apiPost } from "../api.js";
+import { apiPost, apiUpload } from "../api.js";
+import { BOT_AVATARS, avatarToPngBlob } from "./BotAvatars.jsx";
 import {
   labelStyle, inputStyle, btnPrimaryStyle, btnGhostStyle, badgeStyle,
   modalOverlayStyle, modalStyle,
@@ -31,6 +32,7 @@ export function SetupWizard({ config, onClose, onDone, addToast }) {
   const [data, setData] = useState({
     displayname: "",
     localpart: "",
+    avatarId: null,        // id aus BOT_AVATARS oder null
     tokenLabel: "default",
     tokenDurationIdx: DEFAULT_DURATION_IDX,
     roomName: "",
@@ -39,7 +41,7 @@ export function SetupWizard({ config, onClose, onDone, addToast }) {
     encrypted: false,
     isPublic: false,
     invites: (config.defaultUsers || []).map(u => ({
-      mxid: u.mxid, admin: !!(u.default_admin ?? u.defaultAdmin), selected: true,
+      mxid: u.mxid, power_level: (u.default_admin ?? u.defaultAdmin) ? 100 : 0, selected: true,
     })),
   });
   const [extraMxid, setExtraMxid] = useState("");
@@ -79,14 +81,21 @@ export function SetupWizard({ config, onClose, onDone, addToast }) {
       addToast("Schon in der Liste", "error");
       return;
     }
-    setData(d => ({ ...d, invites: [...d.invites, { mxid, admin: false, selected: true }] }));
+    setData(d => ({ ...d, invites: [...d.invites, { mxid, power_level: 0, selected: true }] }));
     setExtraMxid("");
   }
 
-  function toggleInvite(mxid, field) {
+  function toggleInviteSelected(mxid) {
     setData(d => ({
       ...d,
-      invites: d.invites.map(i => i.mxid === mxid ? { ...i, [field]: !i[field] } : i),
+      invites: d.invites.map(i => i.mxid === mxid ? { ...i, selected: !i.selected } : i),
+    }));
+  }
+
+  function setInvitePL(mxid, power_level) {
+    setData(d => ({
+      ...d,
+      invites: d.invites.map(i => i.mxid === mxid ? { ...i, power_level } : i),
     }));
   }
 
@@ -108,11 +117,28 @@ export function SetupWizard({ config, onClose, onDone, addToast }) {
         encrypted: data.encrypted,
         public: data.isPublic,
         alias_localpart: data.roomAlias || null,
-        invites: active.map(i => ({ mxid: i.mxid, power_level: i.admin ? 100 : 0 })),
+        invites: active.map(i => ({ mxid: i.mxid, power_level: i.power_level })),
       },
     };
     try {
       const r = await apiPost("/wizard/setup-bot", payload);
+
+      // Optional: ausgewaehlten Built-in-Avatar nach dem Setup-Erfolg setzen
+      if (data.avatarId && r.bot?.mxid) {
+        const avatar = BOT_AVATARS.find(a => a.id === data.avatarId);
+        if (avatar) {
+          try {
+            const blob = await avatarToPngBlob(avatar.svg, 256);
+            const file = new File([blob], `${avatar.id}.png`, { type: "image/png" });
+            const av = await apiUpload(`/bots/${encodeURIComponent(r.bot.mxid)}/avatar`, file);
+            r.bot.avatar_url = av.avatar_url;
+            r.steps.push({ id: "set_avatar", status: "ok", detail: avatar.name });
+          } catch (avErr) {
+            r.steps.push({ id: "set_avatar", status: "error", detail: avErr.message });
+          }
+        }
+      }
+
       setResult(r);
       setStep(5);
     } catch (e) {
@@ -151,7 +177,10 @@ export function SetupWizard({ config, onClose, onDone, addToast }) {
           <Step3
             data={data}
             extraMxid={extraMxid} setExtraMxid={setExtraMxid}
-            addExtra={addExtra} toggleInvite={toggleInvite} removeInvite={removeInvite}
+            addExtra={addExtra}
+            toggleInviteSelected={toggleInviteSelected}
+            setInvitePL={setInvitePL}
+            removeInvite={removeInvite}
           />
         )}
         {step === 4 && (
@@ -232,6 +261,34 @@ function Step1({ data, setField, onDisplaynameChange, onLocalpartChange }) {
           placeholder="kurswahl-bot" />
         <div style={{ color: "var(--muted)", fontSize: 10, fontFamily: "'Space Mono', monospace", marginTop: 4 }}>
           Automatisch aus dem Anzeigenamen abgeleitet, kann übersteuert werden.
+        </div>
+      </div>
+      <div>
+        <label style={labelStyle}>Avatar (optional)</label>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(8, 1fr)", gap: 6 }}>
+          <button onClick={() => setField("avatarId", null)} type="button"
+            title="Kein Avatar"
+            style={{
+              aspectRatio: "1 / 1", borderRadius: 10,
+              border: `2px solid ${data.avatarId === null ? "var(--accent)" : "var(--border)"}`,
+              background: "var(--bg)", cursor: "pointer", padding: 0,
+              display: "flex", alignItems: "center", justifyContent: "center",
+              color: "var(--muted)", fontSize: 14,
+            }}>—</button>
+          {BOT_AVATARS.map(a => (
+            <button key={a.id} onClick={() => setField("avatarId", a.id)} type="button"
+              title={a.name}
+              style={{
+                aspectRatio: "1 / 1", borderRadius: 10,
+                border: `2px solid ${data.avatarId === a.id ? "var(--accent)" : "transparent"}`,
+                background: "none", cursor: "pointer", padding: 0,
+              }}>
+              <div dangerouslySetInnerHTML={{ __html: a.svg }} style={{ width: "100%", height: "100%" }} />
+            </button>
+          ))}
+        </div>
+        <div style={{ color: "var(--muted)", fontSize: 10, fontFamily: "'Space Mono', monospace", marginTop: 4 }}>
+          Wird nach erfolgreichem Bot-Anlegen als Avatar gesetzt. Eigenes Bild später im Bot-Detail.
         </div>
       </div>
       <div>
@@ -322,12 +379,14 @@ function Toggle({ label, hint, checked, onChange }) {
   );
 }
 
-function Step3({ data, extraMxid, setExtraMxid, addExtra, toggleInvite, removeInvite }) {
+function Step3({ data, extraMxid, setExtraMxid, addExtra, toggleInviteSelected, setInvitePL, removeInvite }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
       <p style={{ color: "var(--muted)", fontSize: 12, fontFamily: "'Space Mono', monospace", lineHeight: 1.6, margin: 0 }}>
-        Wer wird in den Raum eingeladen? Standard-User stammen aus den Settings.
-        Admin = Power Level 100 (kann den Raum mit-administrieren).
+        Wer wird in den Raum eingeladen? Power-Level:
+        <strong style={{ color: "var(--text)" }}> Admin = 100</strong> (mit-administrieren),
+        <strong style={{ color: "var(--text)" }}> Moderator = 50</strong> (Nachrichten redigieren, kicken),
+        <strong style={{ color: "var(--text)" }}> Standard = 0</strong>.
       </p>
       <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 280, overflowY: "auto" }}>
         {data.invites.length === 0 ? (
@@ -341,16 +400,25 @@ function Step3({ data, extraMxid, setExtraMxid, addExtra, toggleInvite, removeIn
             border: "1px solid var(--border)", borderRadius: 8,
           }}>
             <input type="checkbox" checked={inv.selected}
-              onChange={() => toggleInvite(inv.mxid, "selected")}
+              onChange={() => toggleInviteSelected(inv.mxid)}
               style={{ cursor: "pointer" }} />
             <div style={{ flex: 1, minWidth: 0, opacity: inv.selected ? 1 : 0.45 }}>
               <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 12, color: "var(--text)" }}>{inv.mxid}</div>
             </div>
-            <label style={{ display: "flex", alignItems: "center", gap: 6, fontFamily: "'Space Mono', monospace", fontSize: 11, color: "var(--muted)", cursor: "pointer", opacity: inv.selected ? 1 : 0.45 }}>
-              <input type="checkbox" checked={inv.admin} disabled={!inv.selected}
-                onChange={() => toggleInvite(inv.mxid, "admin")} />
-              Admin
-            </label>
+            <select
+              value={inv.power_level}
+              disabled={!inv.selected}
+              onChange={e => setInvitePL(inv.mxid, parseInt(e.target.value, 10))}
+              style={{
+                background: "var(--surface)", border: "1px solid var(--border)",
+                borderRadius: 6, padding: "4px 8px", fontSize: 11,
+                fontFamily: "'Space Mono', monospace", color: "var(--text)",
+                opacity: inv.selected ? 1 : 0.45,
+              }}>
+              <option value={0}>Standard</option>
+              <option value={50}>Moderator</option>
+              <option value={100}>Admin</option>
+            </select>
             <button onClick={() => removeInvite(inv.mxid)} style={{ ...btnGhostStyle, padding: "4px 8px", color: "#ff4d4d" }}>
               <Icon name="x" size={12} />
             </button>
@@ -372,7 +440,8 @@ function Step3({ data, extraMxid, setExtraMxid, addExtra, toggleInvite, removeIn
 
 function Step4({ data }) {
   const active = data.invites.filter(i => i.selected);
-  const admins = active.filter(i => i.admin);
+  const admins = active.filter(i => i.power_level >= 100);
+  const mods = active.filter(i => i.power_level === 50);
   const duration = DURATIONS[data.tokenDurationIdx].label;
 
   return (
@@ -389,10 +458,14 @@ function Step4({ data }) {
       <SummaryRow k="Einladungen" v={`${active.length} User`}
         sub={active.length === 0
           ? "(keine)"
-          : active.map(i => `${i.mxid}${i.admin ? " 👑" : ""}`).join(", ")} />
+          : active.map(i => {
+              const tag = i.power_level >= 100 ? " 👑" : i.power_level === 50 ? " 🛡" : "";
+              return `${i.mxid}${tag}`;
+            }).join(", ")} />
       {active.length > 0 && (
         <div style={{ background: "var(--accent-dim)", border: "1px solid rgba(0,200,150,0.3)", borderRadius: 8, padding: 12, color: "var(--text)", marginTop: 4, lineHeight: 1.6 }}>
-          Bot ist Creator (PL 100). {admins.length} Admin{admins.length === 1 ? "" : "s"} bekommen ebenfalls PL 100.
+          Bot ist Creator (PL 100). {admins.length} Admin{admins.length === 1 ? "" : "s"} (PL 100),
+          {" "}{mods.length} Moderator{mods.length === 1 ? "" : "en"} (PL 50).
         </div>
       )}
     </div>

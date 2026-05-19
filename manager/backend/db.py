@@ -69,6 +69,11 @@ async def init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
+        # Lightweight migrations: nur ALTER, wenn Spalte fehlt.
+        async with db.execute("PRAGMA table_info(bots)") as cur:
+            cols = {row[1] for row in await cur.fetchall()}
+        if "tags" not in cols:
+            await db.execute("ALTER TABLE bots ADD COLUMN tags TEXT NOT NULL DEFAULT ''")
         await db.commit()
 
 
@@ -80,25 +85,40 @@ def _now_ms() -> int:
 # Bots
 # ---------------------------------------------------------------------------
 
+def _tags_to_list(s: str | None) -> list[str]:
+    if not s:
+        return []
+    return [t for t in s.split(",") if t]
+
+
 async def list_bots() -> list[dict[str, Any]]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         rows = await db.execute_fetchall(
-            "SELECT mxid, localpart, displayname, created_at, deactivated "
+            "SELECT mxid, localpart, displayname, created_at, deactivated, tags "
             "FROM bots ORDER BY created_at DESC"
         )
-        return [dict(r) for r in rows]
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["tags"] = _tags_to_list(d.get("tags"))
+            out.append(d)
+        return out
 
 
 async def get_bot(mxid: str) -> dict[str, Any] | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT mxid, localpart, displayname, created_at, deactivated "
+            "SELECT mxid, localpart, displayname, created_at, deactivated, tags "
             "FROM bots WHERE mxid = ?", (mxid,),
         ) as cur:
             row = await cur.fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            d = dict(row)
+            d["tags"] = _tags_to_list(d.get("tags"))
+            return d
 
 
 async def add_bot(mxid: str, localpart: str, displayname: str | None) -> None:
@@ -112,10 +132,14 @@ async def add_bot(mxid: str, localpart: str, displayname: str | None) -> None:
 
 
 async def update_bot(mxid: str, **fields: Any) -> None:
-    allowed = {"displayname", "deactivated"}
+    allowed = {"displayname", "deactivated", "tags"}
     sets = {k: v for k, v in fields.items() if k in allowed}
     if not sets:
         return
+    # tags kommt als Liste rein, intern als CSV speichern.
+    if "tags" in sets and isinstance(sets["tags"], list):
+        cleaned = [t.strip() for t in sets["tags"] if t and t.strip()]
+        sets["tags"] = ",".join(sorted(set(cleaned)))
     keys = ", ".join(f"{k} = ?" for k in sets)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(

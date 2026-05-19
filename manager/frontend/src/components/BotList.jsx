@@ -16,6 +16,10 @@ export function BotList({ config, onSelectBot, onOpenSettings, onOpenAudit, addT
   const [newUsername, setNewUsername] = useState("");
   const [newDisplayname, setNewDisplayname] = useState("");
   const [creating, setCreating] = useState(false);
+  const [search, setSearch] = useState("");
+  const [activeTag, setActiveTag] = useState(null);
+  const [selected, setSelected] = useState(new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
 
   const loadBots = useCallback(async () => {
     setLoading(true);
@@ -30,6 +34,47 @@ export function BotList({ config, onSelectBot, onOpenSettings, onOpenAudit, addT
   }, [addToast]);
 
   useEffect(() => { loadBots(); }, [loadBots]);
+
+  const allTags = Array.from(new Set(bots.flatMap(b => b.tags || []))).sort();
+  const filtered = bots.filter(b => {
+    if (activeTag && !(b.tags || []).includes(activeTag)) return false;
+    if (search) {
+      const s = search.toLowerCase();
+      const hay = `${b.localpart || ""} ${b.displayname || ""} ${b.mxid || ""}`.toLowerCase();
+      if (!hay.includes(s)) return false;
+    }
+    return true;
+  });
+
+  function toggleSelect(mxid) {
+    setSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(mxid)) next.delete(mxid); else next.add(mxid);
+      return next;
+    });
+  }
+
+  async function bulkAction(action, label) {
+    const mxids = Array.from(selected);
+    if (mxids.length === 0) return;
+    if (!confirm(`${label} für ${mxids.length} Bots?`)) return;
+    setBulkBusy(true);
+    try {
+      const r = await apiPost("/bots/bulk", { action, mxids });
+      const okCount = r.results.filter(x => x.status === "ok").length;
+      const errCount = r.results.length - okCount;
+      addToast(
+        `${label}: ${okCount} ok${errCount ? `, ${errCount} Fehler` : ""}`,
+        errCount ? "error" : "success",
+      );
+      setSelected(new Set());
+      loadBots();
+    } catch (e) {
+      addToast("Fehler: " + e.message, "error");
+    } finally {
+      setBulkBusy(false);
+    }
+  }
 
   async function createBot() {
     if (!newUsername) return;
@@ -133,6 +178,67 @@ export function BotList({ config, onSelectBot, onOpenSettings, onOpenAudit, addT
         />
       )}
 
+      {bots.length > 0 && (
+        <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 16, flexWrap: "wrap" }}>
+          <input
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder="Suchen…"
+            style={{ ...inputStyle, flex: 1, minWidth: 200, margin: 0 }}
+          />
+          {allTags.length > 0 && (
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+              <button
+                onClick={() => setActiveTag(null)}
+                style={{
+                  ...badgeStyle, cursor: "pointer",
+                  background: activeTag === null ? "var(--accent-dim)" : "transparent",
+                  color: activeTag === null ? "var(--accent)" : "var(--muted)",
+                  border: `1px solid ${activeTag === null ? "rgba(0,200,150,0.3)" : "var(--border)"}`,
+                }}>alle</button>
+              {allTags.map(t => (
+                <button key={t} onClick={() => setActiveTag(activeTag === t ? null : t)}
+                  style={{
+                    ...badgeStyle, cursor: "pointer",
+                    background: activeTag === t ? "var(--accent-dim)" : "transparent",
+                    color: activeTag === t ? "var(--accent)" : "var(--muted)",
+                    border: `1px solid ${activeTag === t ? "rgba(0,200,150,0.3)" : "var(--border)"}`,
+                  }}>#{t}</button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {selected.size > 0 && (
+        <div style={{
+          display: "flex", gap: 8, alignItems: "center",
+          padding: "10px 14px", marginBottom: 14,
+          background: "var(--accent-dim)", border: "1px solid rgba(0,200,150,0.3)",
+          borderRadius: 10,
+        }}>
+          <span style={{ fontFamily: "'Space Mono', monospace", fontSize: 12, color: "var(--accent)", flex: 1 }}>
+            {selected.size} ausgewählt
+          </span>
+          <button disabled={bulkBusy} onClick={() => bulkAction("deactivate", "Deaktivieren")}
+            style={{ ...btnGhostStyle, color: "#ffa94d", borderColor: "rgba(255,169,77,0.3)", fontSize: 11 }}>
+            <Icon name="power" size={11} /> Deaktivieren
+          </button>
+          <button disabled={bulkBusy} onClick={() => bulkAction("reactivate", "Reaktivieren")}
+            style={{ ...btnGhostStyle, color: "var(--accent)", borderColor: "rgba(0,200,150,0.3)", fontSize: 11 }}>
+            <Icon name="power" size={11} /> Reaktivieren
+          </button>
+          <button disabled={bulkBusy} onClick={() => bulkAction("remove_from_registry", "Aus Registry entfernen")}
+            style={{ ...btnGhostStyle, color: "#ff4d4d", borderColor: "rgba(255,77,77,0.3)", fontSize: 11 }}>
+            <Icon name="trash" size={11} /> Entfernen
+          </button>
+          <button onClick={() => setSelected(new Set())}
+            style={{ ...btnGhostStyle, fontSize: 11 }}>
+            <Icon name="x" size={11} /> Auswahl aufheben
+          </button>
+        </div>
+      )}
+
       {loading ? (
         <div style={{ color: "var(--muted)", fontFamily: "'Space Mono', monospace", fontSize: 13, textAlign: "center", padding: 48 }}>Lade Bots…</div>
       ) : bots.length === 0 ? (
@@ -150,10 +256,20 @@ export function BotList({ config, onSelectBot, onOpenSettings, onOpenAudit, addT
             </button>
           </div>
         </div>
+      ) : filtered.length === 0 ? (
+        <div style={{ color: "var(--muted)", fontFamily: "'Space Mono', monospace", fontSize: 13, textAlign: "center", padding: 48 }}>
+          Keine Bots passen zum Filter.
+        </div>
       ) : (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(230px, 1fr))", gap: 14 }}>
-          {bots.map((bot) => (
-            <BotCard key={bot.mxid} bot={bot} onClick={() => onSelectBot(bot)} />
+          {filtered.map((bot) => (
+            <BotCard
+              key={bot.mxid}
+              bot={bot}
+              selected={selected.has(bot.mxid)}
+              onClick={() => onSelectBot(bot)}
+              onToggleSelect={() => toggleSelect(bot.mxid)}
+            />
           ))}
         </div>
       )}
@@ -161,7 +277,7 @@ export function BotList({ config, onSelectBot, onOpenSettings, onOpenAudit, addT
   );
 }
 
-function BotCard({ bot, onClick }) {
+function BotCard({ bot, selected, onClick, onToggleSelect }) {
   const localpart = bot.localpart || bot.mxid.split(":")[0].replace("@", "");
   const initial = (bot.displayname || localpart)[0]?.toUpperCase() || "B";
   const deactivated = bot.deactivated || !bot.exists_in_synapse;
@@ -169,15 +285,30 @@ function BotCard({ bot, onClick }) {
   return (
     <div onClick={onClick} style={{
       background: "var(--surface)",
-      border: "1px solid var(--border)",
+      border: `1px solid ${selected ? "var(--accent)" : "var(--border)"}`,
       borderRadius: 12,
       padding: "18px 20px",
       cursor: "pointer",
       transition: "border-color 0.15s, transform 0.15s, box-shadow 0.15s",
+      position: "relative",
     }}
-      onMouseEnter={e => { e.currentTarget.style.borderColor = "var(--accent)"; e.currentTarget.style.transform = "translateY(-2px)"; e.currentTarget.style.boxShadow = "0 8px 32px rgba(0,200,150,0.1)"; }}
-      onMouseLeave={e => { e.currentTarget.style.borderColor = "var(--border)"; e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = "none"; }}
+      onMouseEnter={e => { if (!selected) e.currentTarget.style.borderColor = "var(--accent)"; e.currentTarget.style.transform = "translateY(-2px)"; e.currentTarget.style.boxShadow = "0 8px 32px rgba(0,200,150,0.1)"; }}
+      onMouseLeave={e => { if (!selected) e.currentTarget.style.borderColor = "var(--border)"; e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = "none"; }}
     >
+      <button
+        onClick={e => { e.stopPropagation(); onToggleSelect(); }}
+        title={selected ? "Auswahl entfernen" : "Auswählen"}
+        style={{
+          position: "absolute", top: 8, right: 8,
+          width: 22, height: 22, borderRadius: 6,
+          border: `2px solid ${selected ? "var(--accent)" : "var(--border)"}`,
+          background: selected ? "var(--accent)" : "transparent",
+          cursor: "pointer", padding: 0,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          color: "var(--bg)",
+        }}>
+        {selected && <Icon name="check" size={12} />}
+      </button>
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
         <div style={{
           width: 40, height: 40, borderRadius: 10, background: "var(--accent-dim)",
@@ -205,7 +336,14 @@ function BotCard({ bot, onClick }) {
         <span style={{ ...badgeStyle, background: deactivated ? "rgba(255,77,77,0.15)" : "rgba(0,200,150,0.12)", color: deactivated ? "#ff4d4d" : "var(--accent)", border: `1px solid ${deactivated ? "rgba(255,77,77,0.3)" : "rgba(0,200,150,0.3)"}` }}>
           {!bot.exists_in_synapse ? "verwaist" : bot.deactivated ? "deaktiviert" : "aktiv"}
         </span>
-        <span style={{ ...badgeStyle }}>bot</span>
+        {(bot.tags || []).slice(0, 3).map(t => (
+          <span key={t} style={{ ...badgeStyle, color: "var(--accent)", border: "1px solid rgba(0,200,150,0.3)" }}>
+            #{t}
+          </span>
+        ))}
+        {(bot.tags || []).length > 3 && (
+          <span style={badgeStyle}>+{(bot.tags || []).length - 3}</span>
+        )}
       </div>
     </div>
   );

@@ -111,7 +111,7 @@ export function SettingsScreen({ config, onRefresh, onBack, addToast }) {
           <p style={{ fontFamily: "'Space Mono', monospace", fontSize: 13 }}>Noch keine Standard-Nutzer.</p>
         </div>
       ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 32 }}>
           {users.map(u => (
             <div key={u.mxid} style={{
               display: "flex", alignItems: "center", gap: 12,
@@ -148,6 +148,21 @@ export function SettingsScreen({ config, onRefresh, onBack, addToast }) {
           ))}
         </div>
       )}
+
+      <div style={{ marginTop: 32, paddingTop: 24, borderTop: "1px solid var(--border)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+          <div style={{ color: "var(--accent)" }}><Icon name="download" size={18} /></div>
+          <span style={{ fontFamily: "'Space Mono', monospace", fontSize: 10, letterSpacing: 3, color: "var(--muted)", textTransform: "uppercase" }}>Backup</span>
+        </div>
+        <h2 style={{ fontFamily: "'Syne', sans-serif", fontSize: 18, fontWeight: 700, margin: 0, color: "var(--text)" }}>Datenbank-Export</h2>
+        <p style={{ color: "var(--muted)", fontSize: 12, marginTop: 8, fontFamily: "'Space Mono', monospace", lineHeight: 1.6 }}>
+          SQLite-Snapshot der Manager-DB (Registry, Tokens im Klartext, Default-User, Audit-Log). Atomar konsistent via VACUUM INTO.
+        </p>
+        <a href="/api/admin/db-export" download
+          style={{ ...btnPrimaryStyle, textDecoration: "none", marginTop: 12 }}>
+          <Icon name="download" size={14} /> manager.db herunterladen
+        </a>
+      </div>
     </div>
   );
 }

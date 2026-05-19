@@ -19,6 +19,18 @@ das laufende Drumherum (Token rotieren, Raeume anlegen, Bots loeschen).
 - **Audit-Log** — jede schreibende Aktion (Bot-/Token-/Raum-Anlage,
   Wizard-Setup, Standard-User-Pflege, Permanent-Löschung) landet in der
   Manager-DB und ist im UI durchsuchbar (Activity-Icon im Header).
+  Exportierbar als CSV oder JSON.
+- **Bot-Tags** — frei vergebbare Labels pro Bot (z.B. `prod`, `dev`,
+  `personal`). Anzeige in der Bot-Karte, Filter-Leiste oben in der Liste.
+- **Suche** in der Bot-Liste — über Displayname / Localpart / MXID.
+- **Bulk-Operationen** — Checkbox pro Karte, dann „Deaktivieren",
+  „Reaktivieren" oder „Aus Registry entfernen" auf der ganzen Selektion.
+- **DB-Export** — Settings-Screen liefert atomaren SQLite-Snapshot
+  (VACUUM INTO) als Download fuer Offline-Backups.
+- **Erweiterter Health-Check** — `/api/health` prueft Synapse-Reachability,
+  Admin-Token-Gueltigkeit und DB; gibt Counts zurueck (Bots, Default-User,
+  Audit-Eintraege) fuer Monitoring.
+- **Element-Quicklink** — MXID-Pfeil im Bot-Detail-Hero oeffnet matrix.to.
 - **Avatar pro Bot** — Klick auf den Avatar-Kreis im Bot-Detail öffnet
   einen Picker mit **15 mitgelieferten SVG-Avataren** im gleichen Stil
   (Roboter, Tiere, Symbole) ODER File-Upload. Built-in-SVGs werden

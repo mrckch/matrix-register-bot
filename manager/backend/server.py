@@ -22,23 +22,28 @@ Wichtige Architektur-Entscheidung:
 
 from __future__ import annotations
 
+import csv
+import io
 import os
 import secrets
 import string
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+import aiosqlite
 import httpx
 from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from db import (
-    add_bot, add_token, count_audit, get_bot, get_token,
+    DB_PATH, add_bot, add_token, count_audit, get_bot, get_token,
     init_db, list_audit, list_bots, list_default_users, list_tokens,
     log_audit, remove_bot, remove_default_user, remove_token,
     update_bot, upsert_default_user,
@@ -135,11 +140,52 @@ async def _resolve_server_name(http: httpx.AsyncClient) -> str:
 
 @app.get("/api/health")
 async def health(request: Request):
+    """Erweiterter Health-Check — gibt detaillierte Sub-Checks zurueck.
+    Tolerant: ein einzelner Sub-Check kann fehlen, der Endpoint liefert
+    trotzdem 200 (mit status=degraded), damit Monitoring den Container
+    sieht. Nur wenn Synapse nicht erreichbar UND der Admin-Token nicht
+    pruefbar ist, liefern wir 502."""
+    out: dict[str, Any] = {"status": "ok", "checks": {}, "counts": {}}
+    http = request.app.state.http
+
+    # Synapse + Admin-Token
     try:
-        server_name = await _resolve_server_name(request.app.state.http)
-        return {"status": "ok", "server_name": server_name}
+        r = await http.get(
+            f"{SYNAPSE_URL}/_matrix/client/v3/account/whoami",
+            headers=ADMIN_HEADERS,
+            timeout=httpx.Timeout(5.0),
+        )
+        if r.status_code == 200:
+            user_id = r.json().get("user_id", "")
+            out["server_name"] = _server_name_from_mxid(user_id)
+            out["admin_user"] = user_id
+            out["checks"]["synapse"] = "ok"
+            out["checks"]["admin_token"] = "ok"
+        elif r.status_code in (401, 403):
+            out["status"] = "degraded"
+            out["checks"]["synapse"] = "ok"
+            out["checks"]["admin_token"] = f"invalid ({r.status_code})"
+        else:
+            out["status"] = "degraded"
+            out["checks"]["synapse"] = f"unexpected status {r.status_code}"
     except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Synapse not reachable: {e}")
+        out["status"] = "degraded"
+        out["checks"]["synapse"] = f"unreachable: {e}"
+
+    # DB
+    try:
+        out["counts"]["bots"] = len(await list_bots())
+        out["counts"]["default_users"] = len(await list_default_users())
+        out["counts"]["audit_entries"] = await count_audit()
+        out["checks"]["db"] = "ok"
+    except Exception as e:
+        out["status"] = "degraded"
+        out["checks"]["db"] = f"error: {e}"
+
+    if out["checks"].get("synapse", "").startswith("unreachable") \
+       and out["checks"].get("db", "") != "ok":
+        raise HTTPException(502, "Manager nicht funktionsfaehig")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +204,12 @@ class BotImport(BaseModel):
 class BotUpdate(BaseModel):
     displayname: str | None = None
     deactivated: bool | None = None
+    tags: list[str] | None = None
+
+
+class BulkAction(BaseModel):
+    action: str  # "deactivate" | "reactivate" | "remove_from_registry"
+    mxids: list[str]
 
 
 class TokenCreate(BaseModel):
@@ -275,6 +327,8 @@ async def api_update_bot(mxid: str, payload: BotUpdate, request: Request):
         db_patch["displayname"] = payload.displayname
     if payload.deactivated is not None:
         db_patch["deactivated"] = 1 if payload.deactivated else 0
+    if payload.tags is not None:
+        db_patch["tags"] = payload.tags
     if db_patch:
         await update_bot(mxid, **db_patch)
 
@@ -284,8 +338,47 @@ async def api_update_bot(mxid: str, payload: BotUpdate, request: Request):
         await log_audit("reactivate_bot", mxid)
     if payload.displayname is not None:
         await log_audit("rename_bot", mxid, {"displayname": payload.displayname})
+    if payload.tags is not None:
+        await log_audit("set_tags", mxid, {"tags": payload.tags})
 
     return await _enrich_bot(http, await get_bot(mxid))
+
+
+@app.post("/api/bots/bulk")
+async def api_bots_bulk(payload: BulkAction, request: Request):
+    """Fuehrt eine Aktion auf mehreren Bots in einem Rutsch aus.
+    Sammelt pro Bot Erfolg/Fehler und gibt die Liste zurueck —
+    Teilerfolg ist OK.
+    """
+    if payload.action not in ("deactivate", "reactivate", "remove_from_registry"):
+        raise HTTPException(400, f"Unbekannte Aktion: {payload.action}")
+    http = request.app.state.http
+    results: list[dict[str, Any]] = []
+    for mxid in payload.mxids:
+        try:
+            if not await get_bot(mxid):
+                results.append({"mxid": mxid, "status": "error",
+                                "detail": "nicht in Registry"})
+                continue
+            if payload.action == "remove_from_registry":
+                await remove_bot(mxid)
+                await log_audit("remove_bot_from_registry", mxid, {"bulk": True})
+            else:
+                deactivated = payload.action == "deactivate"
+                r = await _admin_put(http, f"/_synapse/admin/v2/users/{_q(mxid)}",
+                                     {"deactivated": deactivated})
+                if r.status_code not in (200, 201):
+                    results.append({"mxid": mxid, "status": "error",
+                                    "detail": f"Synapse: {r.status_code}"})
+                    continue
+                await update_bot(mxid, deactivated=1 if deactivated else 0)
+                await log_audit(
+                    "deactivate_bot" if deactivated else "reactivate_bot",
+                    mxid, {"bulk": True})
+            results.append({"mxid": mxid, "status": "ok"})
+        except Exception as e:
+            results.append({"mxid": mxid, "status": "error", "detail": str(e)})
+    return {"results": results}
 
 
 @app.delete("/api/bots/{mxid}")
@@ -795,6 +888,67 @@ async def api_audit(limit: int = 200, offset: int = 0):
     entries = await list_audit(limit=limit, offset=offset)
     total = await count_audit()
     return {"entries": entries, "total": total, "limit": limit, "offset": offset}
+
+
+# ---------------------------------------------------------------------------
+# /api/admin/* — Backup/Export
+# ---------------------------------------------------------------------------
+
+@app.get("/api/admin/db-export")
+async def api_db_export():
+    """SQLite-Snapshot via VACUUM INTO — atomar konsistent.
+    Liefert die Datei als Download zurueck."""
+    fd, tmp_path = tempfile.mkstemp(suffix=".db", prefix="manager-export-")
+    os.close(fd)
+    os.unlink(tmp_path)  # VACUUM INTO will nicht auf existierende Datei
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"VACUUM INTO '{tmp_path}'")
+    await log_audit("db_export", None, {"size_bytes": os.path.getsize(tmp_path)})
+    return FileResponse(
+        tmp_path,
+        media_type="application/octet-stream",
+        filename=f"manager-{int(time.time())}.db",
+        background=BackgroundTask(os.unlink, tmp_path),
+    )
+
+
+@app.get("/api/admin/audit-export")
+async def api_audit_export(format: str = "json"):
+    """Vollstaendiger Audit-Log als CSV oder JSON-Download."""
+    entries = await list_audit(limit=1_000_000, offset=0)
+    ts = int(time.time())
+
+    if format == "csv":
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["id", "ts", "iso", "action", "target", "detail"])
+        for e in entries:
+            iso = ""
+            try:
+                iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(e["ts"] / 1000))
+            except Exception:
+                pass
+            detail = e.get("detail")
+            if isinstance(detail, dict):
+                import json as _json
+                detail = _json.dumps(detail, ensure_ascii=False)
+            writer.writerow([e["id"], e["ts"], iso, e["action"],
+                             e.get("target") or "", detail or ""])
+        await log_audit("audit_export", None, {"format": "csv", "n": len(entries)})
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename=audit-{ts}.csv"},
+        )
+
+    await log_audit("audit_export", None, {"format": "json", "n": len(entries)})
+    import json as _json
+    body = _json.dumps({"entries": entries}, ensure_ascii=False, indent=2)
+    return Response(
+        content=body,
+        media_type="application/json; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename=audit-{ts}.json"},
+    )
 
 
 # ---------------------------------------------------------------------------

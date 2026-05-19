@@ -78,6 +78,16 @@ export function AuditLog({ onBack, addToast }) {
           Jede schreibende Aktion über den Manager — Bot-Anlage, Token-Erzeugung, Wizard-Setup, Standard-User-Pflege.
           Persistent in der Manager-DB.
         </p>
+        <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+          <a href="/api/admin/audit-export?format=csv" download
+            style={{ ...btnGhostStyle, fontSize: 11, textDecoration: "none" }}>
+            <Icon name="download" size={12} /> CSV
+          </a>
+          <a href="/api/admin/audit-export?format=json" download
+            style={{ ...btnGhostStyle, fontSize: 11, textDecoration: "none" }}>
+            <Icon name="download" size={12} /> JSON
+          </a>
+        </div>
       </div>
 
       {loading && entries.length === 0 ? (

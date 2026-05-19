@@ -170,7 +170,12 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
                 <button onClick={() => setEditing(true)} style={{ ...btnGhostStyle, padding: "4px 8px" }}><Icon name="edit" size={13} /></button>
               </div>
             )}
-            <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: "var(--muted)", marginTop: 4 }}>{mxid}</div>
+            <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: "var(--muted)", marginTop: 4 }}>
+              {mxid}{" "}
+              <a href={`https://matrix.to/#/${mxid}`} target="_blank" rel="noopener noreferrer"
+                 style={{ color: "var(--accent)", textDecoration: "none" }}
+                 title="In Element öffnen">↗</a>
+            </div>
             <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap" }}>
               <span style={{ ...badgeStyle, background: bot.deactivated ? "rgba(255,77,77,0.15)" : "rgba(0,200,150,0.12)", color: bot.deactivated ? "#ff4d4d" : "var(--accent)", border: `1px solid ${bot.deactivated ? "rgba(255,77,77,0.3)" : "rgba(0,200,150,0.3)"}` }}>
                 {bot.deactivated ? "deaktiviert" : "aktiv"}
@@ -179,6 +184,11 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
               {!bot.exists_in_synapse && (
                 <span style={{ ...badgeStyle, color: "#ffa94d", border: "1px solid rgba(255,169,77,0.3)" }}>verwaist</span>
               )}
+              {(bot.tags || []).map(t => (
+                <span key={t} style={{ ...badgeStyle, color: "var(--accent)", border: "1px solid rgba(0,200,150,0.3)" }}>
+                  #{t}
+                </span>
+              ))}
             </div>
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 6, alignSelf: "stretch" }}>
@@ -218,6 +228,15 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
       <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderTop: "none", borderRadius: "0 0 16px 16px", padding: 28 }}>
         {activeTab === "overview" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            <TagsEditor
+              tags={bot.tags || []}
+              onChange={async (next) => {
+                try {
+                  const updated = await apiPut(`/bots/${encodeURIComponent(mxid)}`, { tags: next });
+                  setBot(updated);
+                } catch (e) { addToast("Fehler: " + e.message, "error"); }
+              }}
+            />
             {[
               ["Matrix-ID", mxid],
               ["Erstellt", bot.creation_ts ? new Date(bot.creation_ts).toLocaleString("de-DE") : "—"],
@@ -306,6 +325,83 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
           }}
         />
       )}
+    </div>
+  );
+}
+
+function TagsEditor({ tags, onChange }) {
+  const [adding, setAdding] = useState(false);
+  const [newTag, setNewTag] = useState("");
+
+  function clean(s) { return s.toLowerCase().replace(/[^a-z0-9_-]/g, "").slice(0, 24); }
+
+  async function addTag() {
+    const t = clean(newTag);
+    if (!t) return;
+    if (tags.includes(t)) { setNewTag(""); setAdding(false); return; }
+    await onChange([...tags, t]);
+    setNewTag("");
+    setAdding(false);
+  }
+
+  async function removeTag(t) {
+    await onChange(tags.filter(x => x !== t));
+  }
+
+  return (
+    <div style={{
+      padding: "12px 14px", background: "var(--bg)",
+      border: "1px solid var(--border)", borderRadius: 10,
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+        <span style={{ fontFamily: "'Space Mono', monospace", fontSize: 10, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 1 }}>Tags</span>
+        <div style={{ flex: 1 }} />
+        {!adding && (
+          <button onClick={() => setAdding(true)} style={{ ...btnGhostStyle, padding: "4px 8px", fontSize: 11 }}>
+            <Icon name="plus" size={11} /> Tag
+          </button>
+        )}
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+        {tags.length === 0 && !adding && (
+          <span style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: "var(--muted)" }}>
+            keine Tags — z.B. prod / dev / personal
+          </span>
+        )}
+        {tags.map(t => (
+          <span key={t} style={{
+            ...badgeStyle, color: "var(--accent)",
+            border: "1px solid rgba(0,200,150,0.3)", display: "inline-flex", gap: 4, alignItems: "center",
+          }}>
+            #{t}
+            <button onClick={() => removeTag(t)}
+              style={{ background: "none", border: "none", color: "var(--accent)", cursor: "pointer", padding: 0, lineHeight: 1 }}>×</button>
+          </span>
+        ))}
+        {adding && (
+          <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+            <input
+              autoFocus
+              value={newTag}
+              onChange={e => setNewTag(clean(e.target.value))}
+              onKeyDown={e => {
+                if (e.key === "Enter") addTag();
+                if (e.key === "Escape") { setAdding(false); setNewTag(""); }
+              }}
+              placeholder="tag-name"
+              style={{
+                background: "var(--surface)", border: "1px solid var(--border)",
+                borderRadius: 8, padding: "4px 8px", fontSize: 11,
+                fontFamily: "'Space Mono', monospace", color: "var(--text)",
+                outline: "none", width: 100,
+              }}
+            />
+            <button onClick={addTag} style={{ ...btnGhostStyle, padding: "4px 6px" }}>
+              <Icon name="check" size={11} />
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
