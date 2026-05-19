@@ -31,6 +31,10 @@ das laufende Drumherum (Token rotieren, Raeume anlegen, Bots loeschen).
   Admin-Token-Gueltigkeit und DB; gibt Counts zurueck (Bots, Default-User,
   Audit-Eintraege) fuer Monitoring.
 - **Element-Quicklink** — MXID-Pfeil im Bot-Detail-Hero oeffnet matrix.to.
+- **Testnachricht** — kleiner Block in der Bot-Uebersicht: Empfaenger aus der
+  Standard-User-Liste waehlen, Nachricht eintippen, Bot legt einen 1:1-DM
+  an (oder nutzt einen bestehenden) und postet die Nachricht. Praktisch
+  zum Verifizieren, ob ein Bot wirklich senden kann.
 - **Avatar pro Bot** — Klick auf den Avatar-Kreis im Bot-Detail öffnet
   einen Picker mit **15 mitgelieferten SVG-Avataren** im gleichen Stil
   (Roboter, Tiere, Symbole) ODER File-Upload. Built-in-SVGs werden

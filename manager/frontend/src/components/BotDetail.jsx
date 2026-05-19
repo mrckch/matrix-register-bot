@@ -1,11 +1,11 @@
 import { useState, useEffect } from "react";
 import { Icon } from "./Icon.jsx";
-import { apiGet, apiPut, apiDelete } from "../api.js";
+import { apiGet, apiPut, apiDelete, apiPost } from "../api.js";
 import { CreateRoomTab } from "./CreateRoomTab.jsx";
 import { TokenTab } from "./TokenTab.jsx";
 import { AvatarPicker } from "./AvatarPicker.jsx";
 import {
-  inputStyle, btnPrimaryStyle, btnGhostStyle, badgeStyle,
+  inputStyle, btnPrimaryStyle, btnGhostStyle, badgeStyle, labelStyle,
 } from "../styles.js";
 
 export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
@@ -250,6 +250,10 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
               </div>
             ))}
 
+            {bot.exists_in_synapse && !bot.deactivated && (
+              <TestMessageSection bot={bot} config={config} addToast={addToast} />
+            )}
+
             <div style={{ marginTop: 24, padding: 20, background: "rgba(255,77,77,0.06)", border: "1px solid rgba(255,77,77,0.25)", borderRadius: 10 }}>
               <div style={{ fontFamily: "'Syne', sans-serif", fontWeight: 700, fontSize: 14, color: "#ff4d4d", marginBottom: 6 }}>
                 Danger Zone
@@ -324,6 +328,106 @@ export function BotDetail({ bot: initialBot, config, onBack, addToast }) {
             setShowAvatarPicker(false);
           }}
         />
+      )}
+    </div>
+  );
+}
+
+function TestMessageSection({ bot, config, addToast }) {
+  const localpart = bot.localpart || bot.mxid.split(":")[0].replace("@", "");
+  const defaultUsers = (config.defaultUsers || []).filter(u => u.mxid !== bot.mxid);
+  const [to, setTo] = useState(defaultUsers[0]?.mxid || "");
+  const [message, setMessage] = useState(`Test von ${bot.displayname || localpart} — bist du da?`);
+  const [sending, setSending] = useState(false);
+  const [lastResult, setLastResult] = useState(null);
+
+  async function send() {
+    if (!to) { addToast("Empfänger fehlt", "error"); return; }
+    if (!message.trim()) { addToast("Nachricht ist leer", "error"); return; }
+    setSending(true);
+    try {
+      const r = await apiPost(`/bots/${encodeURIComponent(bot.mxid)}/test-message`, {
+        to_mxid: to,
+        message: message.trim(),
+      });
+      setLastResult(r);
+      addToast(
+        r.room_created ? `DM angelegt + Nachricht gesendet an ${to}`
+                       : `Nachricht gesendet an ${to}`,
+        "success",
+      );
+    } catch (e) {
+      addToast("Fehler: " + e.message, "error");
+    } finally {
+      setSending(false);
+    }
+  }
+
+  return (
+    <div style={{
+      padding: "16px 18px",
+      background: "var(--accent-dim)",
+      border: "1px solid rgba(0,200,150,0.25)",
+      borderRadius: 10,
+      marginTop: 8,
+    }}>
+      <div style={{ fontFamily: "'Syne', sans-serif", fontWeight: 700, fontSize: 14, color: "var(--accent)", marginBottom: 4 }}>
+        Testnachricht senden
+      </div>
+      <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: "var(--muted)", marginBottom: 12, lineHeight: 1.6 }}>
+        Schickt eine Klartext-Nachricht vom Bot an einen Standard-User.
+        Erster Test legt einen DM an, weitere Tests gehen in denselben Raum.
+      </div>
+
+      {defaultUsers.length === 0 ? (
+        <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: "var(--muted)", padding: 12, textAlign: "center" }}>
+          Keine Standard-User gepflegt — bitte erst in den Settings anlegen.
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <div>
+            <label style={labelStyle}>Empfänger</label>
+            <select
+              value={to}
+              onChange={e => setTo(e.target.value)}
+              style={{ ...inputStyle, appearance: "auto" }}
+            >
+              {defaultUsers.map(u => (
+                <option key={u.mxid} value={u.mxid}>{u.mxid}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label style={labelStyle}>Nachricht</label>
+            <textarea
+              value={message}
+              onChange={e => setMessage(e.target.value)}
+              rows={2}
+              style={{ ...inputStyle, resize: "vertical", minHeight: 60, fontFamily: "'Space Mono', monospace" }}
+            />
+          </div>
+          <button onClick={send} disabled={sending}
+            style={{ ...btnPrimaryStyle, justifyContent: "center" }}>
+            <Icon name="chat" size={14} />
+            {sending ? "Sende…" : "Test senden"}
+          </button>
+
+          {lastResult && (
+            <div style={{
+              padding: 10, background: "var(--bg)", borderRadius: 8,
+              border: "1px solid var(--border)",
+              fontFamily: "'Space Mono', monospace", fontSize: 11, lineHeight: 1.6,
+            }}>
+              <div style={{ color: "var(--muted)", marginBottom: 4 }}>
+                {lastResult.room_created ? "Neuer DM" : "Bestehender DM"} · event {lastResult.event_id?.slice(0, 12)}…
+              </div>
+              <a href={lastResult.matrix_to} target="_blank" rel="noopener noreferrer"
+                 style={{ color: "var(--accent)", textDecoration: "none" }}>
+                ↗ In Element öffnen
+              </a>
+            </div>
+          )}
+        </div>
       )}
     </div>
   );

@@ -710,6 +710,112 @@ async def _create_room_as_bot(
     }
 
 
+class TestMessage(BaseModel):
+    to_mxid: str
+    message: str
+
+
+async def _find_or_create_dm(http: httpx.AsyncClient, bot_mxid: str,
+                             bot_token: str, target_mxid: str) -> tuple[str, bool]:
+    """Sucht in bot.m.direct nach einem bestehenden DM-Raum mit target_mxid.
+    Wenn keiner existiert, legt einen neuen an (is_direct=True) und schreibt
+    den Eintrag in m.direct. Gibt (room_id, was_created) zurueck.
+    """
+    auth = {"Authorization": f"Bearer {bot_token}"}
+
+    # m.direct lesen (404 wenn nie gesetzt — kein Problem)
+    directs: dict[str, list[str]] = {}
+    r = await http.get(
+        f"{SYNAPSE_URL}/_matrix/client/v3/user/{_q(bot_mxid)}/account_data/m.direct",
+        headers=auth,
+    )
+    if r.status_code == 200:
+        directs = r.json() or {}
+
+    # Existiert ein DM mit target?
+    existing_room_ids = directs.get(target_mxid, [])
+    for rid in existing_room_ids:
+        # Bot ist noch drin? Sonst gilt der Raum als verwaist.
+        m = await http.get(
+            f"{SYNAPSE_URL}/_matrix/client/v3/rooms/{_q(rid)}/joined_members",
+            headers=auth,
+        )
+        if m.status_code == 200 and bot_mxid in m.json().get("joined", {}):
+            return rid, False
+
+    # Neuen DM anlegen
+    r = await http.post(
+        f"{SYNAPSE_URL}/_matrix/client/v3/createRoom",
+        headers={**auth, "Content-Type": "application/json"},
+        json={
+            "invite": [target_mxid],
+            "is_direct": True,
+            "preset": "trusted_private_chat",  # invitee bekommt PL 100
+            "visibility": "private",
+            "name": f"Test ({bot_mxid.split(':')[0].lstrip('@')})",
+        },
+    )
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"DM-Anlage: {r.text}")
+    room_id = r.json()["room_id"]
+
+    # m.direct aktualisieren
+    directs.setdefault(target_mxid, []).append(room_id)
+    await http.put(
+        f"{SYNAPSE_URL}/_matrix/client/v3/user/{_q(bot_mxid)}/account_data/m.direct",
+        headers={**auth, "Content-Type": "application/json"},
+        json=directs,
+    )
+    return room_id, True
+
+
+@app.post("/api/bots/{mxid}/test-message")
+async def api_send_test_message(mxid: str, payload: TestMessage, request: Request):
+    """Sendet eine Klartext-Nachricht vom Bot an den Ziel-User.
+    Sucht/erstellt einen 1:1-DM (is_direct), schreibt m.direct beim Bot,
+    sendet eine m.room.message. Bei wiederholten Tests an denselben User
+    wird der bestehende DM wiederverwendet — keine Raum-Spam.
+    """
+    if not await get_bot(mxid):
+        raise HTTPException(404, f"Bot {mxid} nicht in der Registry")
+    to = payload.to_mxid.strip()
+    if not to.startswith("@") or ":" not in to:
+        raise HTTPException(400, "to_mxid muss Format @user:server haben")
+    if to == mxid:
+        raise HTTPException(400, "Bot kann sich nicht selbst anschreiben")
+    body = payload.message.strip()
+    if not body:
+        raise HTTPException(400, "message darf nicht leer sein")
+
+    http = request.app.state.http
+    bot_token = await _admin_login_as(http, mxid)
+    room_id, created = await _find_or_create_dm(http, mxid, bot_token, to)
+
+    # Nachricht senden
+    txn = secrets.token_urlsafe(16)
+    r = await http.put(
+        f"{SYNAPSE_URL}/_matrix/client/v3/rooms/{_q(room_id)}/send/m.room.message/{txn}",
+        headers={"Authorization": f"Bearer {bot_token}", "Content-Type": "application/json"},
+        json={"msgtype": "m.text", "body": body},
+    )
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"send: {r.text}")
+    event_id = r.json().get("event_id")
+
+    await log_audit("test_message", mxid, {
+        "to": to, "room_id": room_id, "event_id": event_id,
+        "room_created": created, "length": len(body),
+    })
+
+    return {
+        "room_id": room_id,
+        "event_id": event_id,
+        "room_created": created,
+        "matrix_to": f"https://matrix.to/#/{room_id}/{event_id}" if event_id
+                     else f"https://matrix.to/#/{room_id}",
+    }
+
+
 @app.post("/api/bots/{mxid}/rooms", status_code=201)
 async def api_create_room_for_bot(mxid: str, payload: RoomCreate, request: Request):
     """Legt einen Raum mit dem Bot als Creator an. Genutzt vom CreateRoomTab
